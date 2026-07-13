@@ -1,22 +1,22 @@
 """
-table_to_longtext.py
+0_table_to_longtext.py
 
 [1단계] 표 -> 장문 서술 (Verbalization)
 
-pdf_table_extractor.py 가 생성한 `{stem}_tables.json` (table_markdown 필드 포함)을
+0_pdf_table_extractor.py 가 생성한 `{stem}_tables.json` (table_markdown 필드 포함)을
 입력으로 받아, 각 표를 로컬 Ollama LLM을 통해 자연스러운 한국어 장문 서술로 변환한다.
 
 설계 의도
 ---------
-- PDF -> 표 추출은 pdf_table_extractor.py 가 담당하므로 여기서 재구현하지 않는다.
+- PDF -> 표 추출은 0_pdf_table_extractor.py 가 담당하므로 여기서 재구현하지 않는다.
 - 표가 이미 Markdown 문자열로 와 있으므로, 별도 그룹핑/렌더링 없이 그대로 프롬프트에 삽입한다.
 - 표 -> 장문 변환 시 "표의 모든 셀 값이 최소 1회 이상 언급되었는가"를 자동 체크하여,
   이후 라운드트립(장문 -> 표) 검증 단계에서 어느 쪽이 문제인지 구분할 수 있게 한다.
 
 사용 예
 -------
-    python table_to_longtext.py --input output_docs --output-dir longtext_out --check-coverage
-    python table_to_longtext.py --input output_docs/report_tables.json
+    python 0_table_to_longtext.py --input output_docs --output-dir longtext_out --check-coverage
+    python 0_table_to_longtext.py --input output_docs/report_tables.json
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ def load_table_entries(input_path: Path) -> list[dict]:
     if not files:
         raise FileNotFoundError(
             f"'{input_path}' 에서 *_tables.json 파일을 찾지 못했습니다. "
-            "pdf_table_extractor.py 를 먼저 실행했는지 확인하세요."
+            "0_pdf_table_extractor.py 를 먼저 실행했는지 확인하세요."
         )
 
     entries: list[dict] = []
