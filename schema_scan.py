@@ -153,6 +153,15 @@ def call_ollama_scan(
             wait = 2 ** (attempt - 1)
             print(f"    [재시도 {attempt}/{max_retries}] {e} -> {wait}초 대기 후 재시도")
             time.sleep(wait)
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is not None and 500 <= status < 600:
+                last_error = e
+                wait = 2 ** (attempt - 1)
+                print(f"    [재시도 {attempt}/{max_retries}] HTTP {status} -> {wait}초 대기 후 재시도")
+                time.sleep(wait)
+            else:
+                raise
 
     raise RuntimeError(f"Ollama 스캔 호출이 {max_retries}회 모두 실패했습니다: {last_error}")
 
