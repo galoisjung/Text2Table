@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -126,6 +127,17 @@ def call_ollama_classify(
             if not raw_text:
                 raise ValueError("Ollama가 빈 응답을 반환했습니다.")
             return _extract_json_object(raw_text)
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is not None and status < 500:
+                # 4xx(요청 자체가 잘못됨)는 재시도해도 결과가 같으므로 즉시 실패시킨다.
+                raise
+            # 5xx(502/503/504 등)는 업스트림(예: -cloud 모델의 원격 추론 백엔드)의
+            # 일시적 문제인 경우가 많으므로 재시도 대상에 포함한다.
+            last_error = e
+            wait = 2 ** (attempt - 1)
+            print(f"    [재시도 {attempt}/{max_retries}] HTTP {status} 오류 -> {wait}초 대기 후 재시도")
+            time.sleep(wait)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, ValueError) as e:
             last_error = e
             wait = 2 ** (attempt - 1)
@@ -209,6 +221,40 @@ def classify_and_select_preset(
 
 
 # ─────────────────────────────────────────────────────────────
+# 3.5. 중간 결과 저장/로드 (JSONL, 처리 즉시 1건씩 append)
+# ─────────────────────────────────────────────────────────────
+def _append_jsonl(path: Path, obj: dict) -> None:
+    """
+    결과 1건을 즉시 파일에 append하고 flush+fsync한다.
+    루프 도중 프로세스가 죽거나(502 반복, Ctrl+C, OOM 등) 해도
+    이미 append된 항목들은 디스크에 남아 있다.
+    """
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass  # 일부 파일시스템/환경은 fsync를 지원하지 않음 -> 무시
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    results = []
+    with open(path, encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                results.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"    [경고] {path.name} {line_no}번째 줄 파싱 실패 -> 무시")
+    return results
+
+
+# ─────────────────────────────────────────────────────────────
 # 4. 메인 (CLI)
 # ─────────────────────────────────────────────────────────────
 _TEXT_INPUT_SUFFIXES = {".json", ".txt", ".md"}
@@ -288,6 +334,11 @@ def main():
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument("--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="--output과 같은 폴더의 중간 저장 파일(.jsonl)을 읽어 이미 처리된 item_id는 건너뛰고 이어서 처리",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -296,11 +347,45 @@ def main():
     items = _load_texts(input_path, args.field, recursive=args.recursive)
     print(f"총 {len(items)}개 항목을 분류합니다.")
 
-    results = []
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_path = output_path.with_suffix(".jsonl")
+
+    # --resume: 기존 jsonl에서 "오류(예외)"로 끝나지 않은 item_id는 이미 완료된 것으로
+    # 보고 건너뛴다. 신뢰도 부족 등으로 preset_id=None인 정상 폴백 결과도 완료로 취급한다.
+    existing_results: dict[str, dict] = {}
+    if args.resume and jsonl_path.exists():
+        for r in _read_jsonl(jsonl_path):
+            iid = r.get("item_id")
+            if iid is not None:
+                existing_results[iid] = r  # 같은 item_id가 여러 번 있으면 마지막 것으로 덮어씀
+        done_ids = {
+            iid
+            for iid, r in existing_results.items()
+            if not str(r.get("fallback_reason", "")).startswith("오류:")
+        }
+        print(f"[재개 모드] 기존 결과 {len(existing_results)}건 로드, 완료된 {len(done_ids)}건은 건너뜁니다.")
+    else:
+        done_ids = set()
+        if jsonl_path.exists():
+            print(f"[주의] --resume 없이 실행되어 기존 {jsonl_path.name}을 새로 덮어씁니다.")
+            jsonl_path.unlink()
+
+    # 재개 모드에서 이미 완료된 결과는 최종 집계에 그대로 포함시킨다.
+    results: list[dict] = [r for iid, r in existing_results.items() if iid in done_ids]
     preset_counts: dict[str, int] = {}
     fallback_count = 0
+    for r in results:
+        if r.get("preset_id"):
+            preset_counts[r["preset_id"]] = preset_counts.get(r["preset_id"], 0) + 1
+        else:
+            fallback_count += 1
 
     for i, item in enumerate(items, 1):
+        if args.resume and item["item_id"] in done_ids:
+            print(f"[{i}/{len(items)}] {item['item_id']} 이미 완료됨 -> 건너뜀")
+            continue
+
         print(f"[{i}/{len(items)}] {item['item_id']} 분류 중...")
         try:
             result = classify_and_select_preset(
@@ -316,6 +401,7 @@ def main():
 
         result["item_id"] = item["item_id"]
         results.append(result)
+        _append_jsonl(jsonl_path, result)  # <- 항목 처리 즉시 디스크에 저장 (핵심)
 
         if result["preset_id"]:
             preset_counts[result["preset_id"]] = preset_counts.get(result["preset_id"], 0) + 1
@@ -324,14 +410,21 @@ def main():
             fallback_count += 1
             print(f"    -> 폴백 (사유: {result['fallback_reason']})")
 
-    with open(args.output, "w", encoding="utf-8") as f:
+    # 재개로 쌓였을 수 있는 중복/실패 잔여 라인을 정리하기 위해
+    # 최종 결과 기준으로 jsonl을 한 번 깔끔하게 재작성한다.
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for r in results:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
     print(f"\n=== 분류 완료 ===")
     for preset_id, count in sorted(preset_counts.items(), key=lambda x: -x[1]):
         print(f"  {preset_id}: {count}건")
     print(f"  폴백(자유 스키마 필요): {fallback_count}건")
-    print(f"결과 저장: {args.output}")
+    print(f"중간 저장(재개용): {jsonl_path}")
+    print(f"결과 저장: {output_path}")
 
 
 if __name__ == "__main__":

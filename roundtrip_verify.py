@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 
@@ -154,6 +155,40 @@ def _build_fail_reason(hall: dict, omit: dict, hall_th: float, omit_th: float) -
 
 
 # ─────────────────────────────────────────────────────────────
+# 2.5. 중간 결과 저장/로드 (JSONL, 처리 즉시 1건씩 append)
+# ─────────────────────────────────────────────────────────────
+def _append_jsonl(path: Path, obj: dict) -> None:
+    """
+    결과 1건을 즉시 파일에 append하고 flush+fsync한다.
+    round-trip 검증은 항목마다 LLM 호출이 있어 도중에 죽을 수 있으므로
+    (네트워크 오류, Ctrl+C 등) 이미 append된 항목들은 디스크에 남아 있다.
+    """
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass  # 일부 파일시스템/환경은 fsync를 지원하지 않음 -> 무시
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    results = []
+    with open(path, encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                results.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"    [경고] {path.name} {line_no}번째 줄 파싱 실패 -> 무시")
+    return results
+
+
+# ─────────────────────────────────────────────────────────────
 # 3. CLI: D의 출력과 원본 long_text를 조인해서 실행
 # ─────────────────────────────────────────────────────────────
 def main():
@@ -170,6 +205,11 @@ def main():
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument("--hallucination-threshold", type=float, default=DEFAULT_HALLUCINATION_THRESHOLD)
     parser.add_argument("--omission-threshold", type=float, default=DEFAULT_OMISSION_THRESHOLD)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="--output과 같은 폴더의 중간 저장 파일(.jsonl)을 읽어 이미 처리된 item_id는 건너뛰고 이어서 처리",
+    )
     args = parser.parse_args()
 
     with open(args.longtext, encoding="utf-8") as f:
@@ -177,8 +217,30 @@ def main():
     with open(args.extracted, encoding="utf-8") as f:
         extracted_entries = json.load(f)
 
-    results = []
-    fail_count = 0
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_path = output_path.with_suffix(".jsonl")
+
+    # --resume: 기존 jsonl에서 "error" 없이 끝난 item_id는 (통과/실패 여부와 무관하게)
+    # 정상적으로 검증이 완료된 것으로 보고 건너뛴다. LLM 호출 자체가 죽었던
+    # 항목(error 있음)만 다시 시도한다.
+    existing_results: dict[str, dict] = {}
+    if args.resume and jsonl_path.exists():
+        for r in _read_jsonl(jsonl_path):
+            iid = r.get("item_id")
+            if iid is not None:
+                existing_results[iid] = r  # 같은 item_id가 여러 번 있으면 마지막 것으로 덮어씀
+        done_ids = {iid for iid, r in existing_results.items() if not r.get("error")}
+        print(f"[재개 모드] 기존 결과 {len(existing_results)}건 로드, 완료된 {len(done_ids)}건은 건너뜁니다.")
+    else:
+        done_ids = set()
+        if jsonl_path.exists():
+            print(f"[주의] --resume 없이 실행되어 기존 {jsonl_path.name}을 새로 덮어씁니다.")
+            jsonl_path.unlink()
+
+    # 재개 모드에서 이미 완료된 결과는 최종 집계에 그대로 포함시킨다.
+    results: list[dict] = [r for iid, r in existing_results.items() if iid in done_ids]
+    fail_count = len([r for r in results if not r.get("passed")])
 
     for ex in extracted_entries:
         item_id = ex["item_id"]
@@ -188,23 +250,42 @@ def main():
         if entry is None:
             print(f"[경고] {item_id}: 원본 long_text를 찾지 못해 건너뜁니다.")
             continue
+        if args.resume and item_id in done_ids:
+            print(f"{item_id} 이미 완료됨 -> 건너뜀")
+            continue
 
         print(f"{item_id} 검증 중...")
-        result = verify_extraction(
-            entry.get("long_text", ""),
-            table_markdown,
-            context_before=entry.get("context_before", ""),
-            context_after=entry.get("context_after", ""),
-            genre=args.genre,
-            model=args.model,
-            ollama_url=args.ollama_url,
-            timeout=args.timeout,
-            max_retries=args.max_retries,
-            hallucination_threshold=args.hallucination_threshold,
-            omission_threshold=args.omission_threshold,
-        )
+        try:
+            result = verify_extraction(
+                entry.get("long_text", ""),
+                table_markdown,
+                context_before=entry.get("context_before", ""),
+                context_after=entry.get("context_after", ""),
+                genre=args.genre,
+                model=args.model,
+                ollama_url=args.ollama_url,
+                timeout=args.timeout,
+                max_retries=args.max_retries,
+                hallucination_threshold=args.hallucination_threshold,
+                omission_threshold=args.omission_threshold,
+            )
+        except Exception as e:
+            print(f"    [오류] {item_id} 검증 실패: {e}")
+            result = {
+                "hallucination_check": None,
+                "omission_check": None,
+                "regenerated_long_text": "",
+                "passed": False,
+                "fail_reason": None,
+                "error": str(e),
+            }
+
         result["item_id"] = item_id
         results.append(result)
+        _append_jsonl(jsonl_path, result)  # <- 항목 처리 즉시 디스크에 저장 (핵심)
+
+        if result.get("error"):
+            continue
 
         if result["passed"]:
             print("    -> 통과")
@@ -212,12 +293,19 @@ def main():
             fail_count += 1
             print(f"    -> 실패: {result['fail_reason']}")
 
-    with open(args.output, "w", encoding="utf-8") as f:
+    # 재개로 쌓였을 수 있는 중복/실패 잔여 라인을 정리하기 위해
+    # 최종 결과 기준으로 jsonl을 한 번 깔끔하게 재작성한다.
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for r in results:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
     print(f"\n=== 검증 완료 ===")
     print(f"통과: {len(results) - fail_count}/{len(results)}, 실패: {fail_count}")
-    print(f"결과 저장: {args.output}")
+    print(f"중간 저장(재개용): {jsonl_path}")
+    print(f"결과 저장: {output_path}")
 
 
 if __name__ == "__main__":

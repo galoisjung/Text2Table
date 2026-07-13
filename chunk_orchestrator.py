@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 
@@ -274,6 +275,40 @@ def process_document(
 
 
 # ─────────────────────────────────────────────────────────────
+# 4.5. 중간 결과 저장/로드 (JSONL, 처리 즉시 1건씩 append)
+# ─────────────────────────────────────────────────────────────
+def _append_jsonl(path: Path, obj: dict) -> None:
+    """
+    결과 1건을 즉시 파일에 append하고 flush+fsync한다.
+    청크가 많은 문서를 처리하다 도중에 죽어도(네트워크 오류, Ctrl+C 등)
+    이미 append된 문서 단위 결과는 디스크에 남아 있다.
+    """
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass  # 일부 파일시스템/환경은 fsync를 지원하지 않음 -> 무시
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    results = []
+    with open(path, encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                results.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"    [경고] {path.name} {line_no}번째 줄 파싱 실패 -> 무시")
+    return results
+
+
+# ─────────────────────────────────────────────────────────────
 # 5. CLI
 # ─────────────────────────────────────────────────────────────
 def main():
@@ -293,6 +328,11 @@ def main():
                          help="토큰 수 근사 계산에 쓸 문자/토큰 비율")
     parser.add_argument("--chunk-overlap-ratio", type=float, default=DEFAULT_CHUNK_OVERLAP_RATIO)
     parser.add_argument("--schema-scan-sample-chunks", type=int, default=DEFAULT_SCHEMA_SCAN_SAMPLE_CHUNKS)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="--output과 같은 폴더의 중간 저장 파일(.jsonl)을 읽어 이미 성공한 item_id는 건너뛰고 이어서 처리",
+    )
     args = parser.parse_args()
 
     with open(args.longtext, encoding="utf-8") as f:
@@ -307,7 +347,28 @@ def main():
         }.items() if v is not None
     }
 
-    results = []
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_path = output_path.with_suffix(".jsonl")
+
+    # --resume: 기존 jsonl에서 "error" 없이 끝난 item_id는 성공으로 보고 건너뛴다.
+    existing_results: dict[str, dict] = {}
+    if args.resume and jsonl_path.exists():
+        for r in _read_jsonl(jsonl_path):
+            iid = r.get("item_id")
+            if iid is not None:
+                existing_results[iid] = r  # 같은 item_id가 여러 번 있으면 마지막 것으로 덮어씀
+        done_ids = {iid for iid, r in existing_results.items() if not r.get("error")}
+        print(f"[재개 모드] 기존 결과 {len(existing_results)}건 로드, 성공한 {len(done_ids)}건은 건너뜁니다.")
+    else:
+        done_ids = set()
+        if jsonl_path.exists():
+            print(f"[주의] --resume 없이 실행되어 기존 {jsonl_path.name}을 새로 덮어씁니다.")
+            jsonl_path.unlink()
+
+    # 재개 모드에서 이미 성공한 결과는 최종 집계에 그대로 포함시킨다.
+    results: list[dict] = [r for iid, r in existing_results.items() if iid in done_ids]
+
     for c in classifications:
         item_id = c["item_id"]
         preset_id = c.get("preset_id")
@@ -319,22 +380,34 @@ def main():
         if not preset_id:
             print(f"[건너뜀] {item_id}: 폴백 항목 (자유 스키마 경로 필요)")
             continue
+        if args.resume and item_id in done_ids:
+            print(f"{item_id} ({preset_id}) 이미 완료됨 -> 건너뜀")
+            continue
 
         print(f"{item_id} ({preset_id}) 처리 중...")
-        result = process_document(
-            preset_id,
-            entry.get("long_text", ""),
-            context_before=entry.get("context_before", ""),
-            context_after=entry.get("context_after", ""),
-            model_context_tokens=args.model_context_tokens,
-            reserved_tokens=args.reserved_tokens,
-            chars_per_token=args.chars_per_token,
-            chunk_overlap_ratio=args.chunk_overlap_ratio,
-            schema_scan_sample_chunks=args.schema_scan_sample_chunks,
-            **llm_kwargs,
-        )
+        try:
+            result = process_document(
+                preset_id,
+                entry.get("long_text", ""),
+                context_before=entry.get("context_before", ""),
+                context_after=entry.get("context_after", ""),
+                model_context_tokens=args.model_context_tokens,
+                reserved_tokens=args.reserved_tokens,
+                chars_per_token=args.chars_per_token,
+                chunk_overlap_ratio=args.chunk_overlap_ratio,
+                schema_scan_sample_chunks=args.schema_scan_sample_chunks,
+                **llm_kwargs,
+            )
+        except Exception as e:
+            print(f"    [오류] {item_id} 처리 실패: {e}")
+            result = {"error": str(e)}
+
         result["item_id"] = item_id
         results.append(result)
+        _append_jsonl(jsonl_path, result)  # <- 문서 처리 즉시 디스크에 저장 (핵심)
+
+        if result.get("error"):
+            continue
 
         v = result.get("validation", {})
         print(f"    -> chunked={result.get('chunked')}, num_chunks={result.get('num_chunks')}, "
@@ -342,9 +415,16 @@ def main():
         if result.get("merge_conflicts"):
             print(f"    [경고] 병합 충돌 {len(result['merge_conflicts'])}건: {result['merge_conflicts'][:2]}")
 
-    with open(args.output, "w", encoding="utf-8") as f:
+    # 재개로 쌓였을 수 있는 중복/실패 잔여 라인을 정리하기 위해
+    # 최종 결과 기준으로 jsonl을 한 번 깔끔하게 재작성한다.
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for r in results:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-    print(f"\n결과 저장: {args.output}")
+    print(f"\n중간 저장(재개용): {jsonl_path}")
+    print(f"결과 저장: {output_path}")
 
 
 if __name__ == "__main__":
