@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -117,6 +118,17 @@ def call_ollama_generate(
             if not text:
                 raise ValueError("Ollama가 빈 응답을 반환했습니다.")
             return text
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is not None and status < 500:
+                # 4xx(요청 자체가 잘못됨)는 재시도해도 결과가 같으므로 즉시 실패시킨다.
+                raise
+            # 5xx(502/503/504 등)는 업스트림(예: -cloud 모델의 원격 추론 백엔드)의
+            # 일시적 문제인 경우가 많으므로 재시도 대상에 포함한다.
+            last_error = e
+            wait = 2 ** (attempt - 1)
+            print(f"    [재시도 {attempt}/{max_retries}] HTTP {status} 오류 -> {wait}초 대기 후 재시도")
+            time.sleep(wait)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, ValueError) as e:
             last_error = e
             wait = 2 ** (attempt - 1)
@@ -194,6 +206,40 @@ def check_value_coverage(long_text: str, values: list[str]) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
+# 4.5. 중간 결과 저장/로드 (JSONL, 처리 즉시 1건씩 append)
+# ─────────────────────────────────────────────────────────────
+def _append_jsonl(path: Path, obj: dict) -> None:
+    """
+    결과 1건을 즉시 파일에 append하고 flush+fsync한다.
+    루프 도중 프로세스가 죽거나(502 반복, Ctrl+C, OOM 등) 해도
+    이미 append된 항목들은 디스크에 남아 있다.
+    """
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass  # 일부 파일시스템/환경은 fsync를 지원하지 않음 -> 무시
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    results = []
+    with open(path, encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                results.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"    [경고] {path.name} {line_no}번째 줄 파싱 실패 -> 무시")
+    return results
+
+
+# ─────────────────────────────────────────────────────────────
 # 5. 메인 처리
 # ─────────────────────────────────────────────────────────────
 def process_table_entry(
@@ -265,6 +311,11 @@ def main():
         action="store_true",
         help="생성된 장문에 표의 모든 값이 포함되었는지 느슨하게 검증",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="output-dir의 기존 tables_longtext.jsonl을 읽어 이미 성공한 table_id는 건너뛰고 이어서 처리",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -274,9 +325,36 @@ def main():
     entries = load_table_entries(input_path)
     print(f"총 {len(entries)}개의 표 엔트리를 로드했습니다.")
 
-    results = []
+    jsonl_path = output_dir / "tables_longtext.jsonl"
+
+    # --resume: 기존 jsonl에서 이미 "성공"한 table_id는 건너뛴다.
+    # (실패했던 항목은 done_ids에 포함시키지 않아 이번 실행에서 다시 시도된다.)
+    existing_results: dict[str, dict] = {}
+    if args.resume and jsonl_path.exists():
+        for r in _read_jsonl(jsonl_path):
+            tid = r.get("table_id")
+            if tid is not None:
+                existing_results[tid] = r  # 같은 table_id가 여러 번 있으면 마지막 것으로 덮어씀
+        done_ids = {
+            tid for tid, r in existing_results.items() if r.get("long_text") and not r.get("error")
+        }
+        print(f"[재개 모드] 기존 결과 {len(existing_results)}건 로드, 성공한 {len(done_ids)}건은 건너뜁니다.")
+    else:
+        done_ids = set()
+        if jsonl_path.exists():
+            print(f"[주의] --resume 없이 실행되어 기존 {jsonl_path.name}을 새로 덮어씁니다.")
+            jsonl_path.unlink()
+
+    # 재개 모드에서 이미 성공한 결과는 최종 집계에 그대로 포함시킨다.
+    results: list[dict] = [r for tid, r in existing_results.items() if tid in done_ids]
+
     for idx, entry in enumerate(entries, 1):
-        print(f"[{idx}/{len(entries)}] table_id={entry.get('table_id')} 처리 중...")
+        table_id = entry.get("table_id")
+        if args.resume and table_id in done_ids:
+            print(f"[{idx}/{len(entries)}] table_id={table_id} 이미 완료됨 -> 건너뜀")
+            continue
+
+        print(f"[{idx}/{len(entries)}] table_id={table_id} 처리 중...")
         try:
             result = process_table_entry(
                 entry,
@@ -287,7 +365,6 @@ def main():
                 genre=args.genre,
                 check_coverage=args.check_coverage,
             )
-            results.append(result)
 
             if args.check_coverage and "coverage" in result:
                 cov = result["coverage"]
@@ -298,14 +375,21 @@ def main():
                         f"{' 외 다수' if len(cov['missing_values']) > 5 else ''}"
                     )
         except Exception as e:
-            print(f"    [오류] table_id={entry.get('table_id')} 처리 실패: {e}")
-            results.append(
-                {
-                    "table_id": entry.get("table_id"),
-                    "source_file": entry.get("source_file"),
-                    "error": str(e),
-                }
-            )
+            print(f"    [오류] table_id={table_id} 처리 실패: {e}")
+            result = {
+                "table_id": table_id,
+                "source_file": entry.get("source_file"),
+                "error": str(e),
+            }
+
+        results.append(result)
+        _append_jsonl(jsonl_path, result)  # <- 항목 처리 즉시 디스크에 저장 (핵심)
+
+    # 재개로 쌓였을 수 있는 중복/실패 잔여 라인을 정리하기 위해
+    # 최종 결과 기준으로 jsonl을 한 번 깔끔하게 재작성한다.
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for r in results:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     out_json_path = output_dir / "tables_longtext.json"
     with open(out_json_path, "w", encoding="utf-8") as f:
@@ -320,6 +404,7 @@ def main():
 
     success_count = len([r for r in results if r.get("long_text")])
     print(f"\n완료: {success_count}/{len(results)}개 표 서술 생성")
+    print(f"중간 저장(재개용): {jsonl_path}")
     print(f"결과 저장: {out_json_path}")
     print(f"미리보기용 텍스트: {out_txt_path}")
 

@@ -211,7 +211,10 @@ def classify_and_select_preset(
 # ─────────────────────────────────────────────────────────────
 # 4. 메인 (CLI)
 # ─────────────────────────────────────────────────────────────
-def _load_texts(input_path: Path, field: str) -> list[dict]:
+_TEXT_INPUT_SUFFIXES = {".json", ".txt", ".md"}
+
+
+def _load_texts_from_file(input_path: Path, field: str) -> list[dict]:
     """
     .json이면 [{field: "..."} ...] 구조로 보고 각 항목에서 field를 뽑는다.
     .txt/.md 등이면 파일 전체를 텍스트 하나로 취급한다.
@@ -229,10 +232,56 @@ def _load_texts(input_path: Path, field: str) -> list[dict]:
         return [{"item_id": input_path.stem, "text": text}]
 
 
+def _load_texts(input_path: Path, field: str, recursive: bool = True) -> list[dict]:
+    """
+    input_path가 파일이면 기존과 동일하게 처리한다.
+    input_path가 폴더면 그 안의 .json/.txt/.md 파일들을 모두 찾아 각각
+    _load_texts_from_file로 읽은 뒤 하나의 리스트로 합친다.
+    폴더 입력일 때는 파일명 충돌을 막기 위해 item_id 앞에 "파일stem__"을 붙인다.
+    """
+    if input_path.is_file():
+        return _load_texts_from_file(input_path, field)
+
+    if not input_path.is_dir():
+        raise FileNotFoundError(f"입력 경로가 존재하지 않습니다: {input_path}")
+
+    glob_fn = input_path.rglob if recursive else input_path.glob
+    files = sorted(
+        p for p in glob_fn("*") if p.is_file() and p.suffix.lower() in _TEXT_INPUT_SUFFIXES
+    )
+    if not files:
+        raise ValueError(
+            f"입력 폴더에 처리 가능한 파일(.json/.txt/.md)이 없습니다: {input_path}"
+        )
+
+    items: list[dict] = []
+    for fp in files:
+        try:
+            file_items = _load_texts_from_file(fp, field)
+        except Exception as e:
+            print(f"    [건너뜀] {fp}: 읽기 실패 ({e})")
+            continue
+        for item in file_items:
+            item["item_id"] = f"{fp.stem}__{item['item_id']}"
+            items.append(item)
+    return items
+
+
 def main():
     parser = argparse.ArgumentParser(description="텍스트를 축 분류하여 preset을 선택합니다.")
-    parser.add_argument("--input", required=True, help="입력 파일 (.json 배열 또는 .txt/.md 단일 텍스트)")
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="입력 파일(.json 배열 또는 .txt/.md 단일 텍스트) 또는 그런 파일들이 들어있는 폴더 경로",
+    )
     parser.add_argument("--field", default="long_text", help=".json 입력일 때 텍스트가 담긴 필드명")
+    parser.add_argument(
+        "--no-recursive",
+        dest="recursive",
+        action="store_false",
+        default=True,
+        help="폴더 입력일 때 하위 폴더까지 탐색하지 않음 (기본값: 하위 폴더까지 탐색)",
+    )
     parser.add_argument("--output", default="preset_classification.json", help="결과 저장 경로")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
@@ -241,7 +290,10 @@ def main():
     parser.add_argument("--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD)
     args = parser.parse_args()
 
-    items = _load_texts(Path(args.input), args.field)
+    input_path = Path(args.input)
+    if input_path.is_dir():
+        print(f"폴더 입력 감지: {input_path} (recursive={args.recursive})")
+    items = _load_texts(input_path, args.field, recursive=args.recursive)
     print(f"총 {len(items)}개 항목을 분류합니다.")
 
     results = []

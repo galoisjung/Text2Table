@@ -33,7 +33,7 @@ from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 # ─────────────────────────────────────────────────────────────
 # 기본 설정 (CLI 인자로 덮어쓸 수 있음)
 # ─────────────────────────────────────────────────────────────
-DEFAULT_INPUT_DIR = Path("samples")
+DEFAULT_INPUT_DIR = Path("valuation_reports")
 DEFAULT_OUTPUT_DIR = Path("output_docs")
 DEFAULT_GPU = 0
 
