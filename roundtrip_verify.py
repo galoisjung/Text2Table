@@ -101,6 +101,7 @@ def verify_extraction(
 ) -> dict:
     if not candidate_table_markdown.strip():
         return {
+            "table_markdown": candidate_table_markdown,
             "hallucination_check": None,
             "omission_check": None,
             "regenerated_long_text": "",
@@ -129,6 +130,7 @@ def verify_extraction(
     )
 
     return {
+        "table_markdown": candidate_table_markdown,
         "hallucination_check": hallucination_check,
         "omission_check": omission_check,
         "regenerated_long_text": regenerated_long_text,
@@ -189,8 +191,71 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────
-# 3. CLI: D의 출력과 원본 long_text를 조인해서 실행
+# 2.6. 사람이 바로 읽는 Markdown 리포트
 # ─────────────────────────────────────────────────────────────
+def build_markdown_report(
+    results: list[dict],
+    longtext_entries: dict[str, dict],
+    extracted_entries_by_id: dict[str, dict],
+) -> str:
+    lines = ["# Round-trip 검증 결과\n"]
+    passed_count = len([r for r in results if r.get("passed")])
+    lines.append(f"총 {len(results)}건 중 통과 {passed_count}건, 실패 {len(results) - passed_count}건\n")
+    lines.append("---\n")
+
+    for r in results:
+        item_id = r.get("item_id", "(알수없음)")
+        entry = longtext_entries.get(item_id, {})
+        ex = extracted_entries_by_id.get(item_id, {})
+        preset_id = ex.get("preset_id", "-")
+        page_number = entry.get("page_number", "-")
+
+        if r.get("error"):
+            status = f"⚠️ 오류: {r['error']}"
+        elif r.get("passed"):
+            status = "✅ 통과"
+        else:
+            status = f"❌ 실패 — {r.get('fail_reason', '')}"
+
+        lines.append(f"## {item_id}  (preset: {preset_id}, page: {page_number}) — {status}\n")
+
+        lines.append("**원문 (long_text)**\n")
+        lines.append(f"> {entry.get('long_text', '(원문을 찾지 못함)')}\n")
+
+        original_table = entry.get("table_markdown", "")
+        lines.append("**정답 표 (원본 table_markdown — long_text로 변환되기 전 원래 표, 참고용)**\n")
+        lines.append(original_table if original_table.strip() else "(원본 표 없음 -- long_text가 원본 표 없이 생성된 경우)")
+        lines.append("")
+
+        lines.append("**추출된 표 (이번 파이프라인이 long_text만 보고 재구성한 결과)**\n")
+        table_md = r.get("table_markdown", "")
+        lines.append(table_md if table_md.strip() else "(표 없음)")
+        lines.append("")
+
+        lines.append("**복원된 장문 (round-trip 결과)**\n")
+        lines.append(f"> {r.get('regenerated_long_text') or '(복원 실패)'}\n")
+
+        hall = r.get("hallucination_check")
+        omit = r.get("omission_check")
+        lines.append("**검증 수치**")
+        if hall:
+            lines.append(
+                f"- 환각 체크: coverage={hall['coverage_ratio']} "
+                f"({hall['covered_values']}/{hall['total_values']}), "
+                f"의심값={hall['missing_values']}"
+            )
+        if omit:
+            lines.append(
+                f"- 누락 체크: coverage={omit['coverage_ratio']} "
+                f"({omit['covered_values']}/{omit['total_values']}), "
+                f"사라진값={omit['missing_values']}"
+            )
+        lines.append("\n---\n")
+
+    return "\n".join(lines)
+
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="chunk_orchestrator.py의 추출 결과를 round-trip으로 자기검증합니다."
@@ -210,16 +275,41 @@ def main():
         action="store_true",
         help="--output과 같은 폴더의 중간 저장 파일(.jsonl)을 읽어 이미 처리된 item_id는 건너뛰고 이어서 처리",
     )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="LLM을 새로 호출하지 않고, 기존 .jsonl만 읽어 .json/.md 리포트를 재생성한다. "
+             "실행이 중간에 끊겨 최종 .json/.md가 안 만들어졌을 때 사용.",
+    )
     args = parser.parse_args()
 
     with open(args.longtext, encoding="utf-8") as f:
         longtext_entries = {e["table_id"]: e for e in json.load(f)}
     with open(args.extracted, encoding="utf-8") as f:
         extracted_entries = json.load(f)
+    extracted_entries_by_id = {e["item_id"]: e for e in extracted_entries}
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_path.with_suffix(".jsonl")
+
+    if args.report_only:
+        if not jsonl_path.exists():
+            print(f"[오류] {jsonl_path}가 없어 리포트를 재생성할 수 없습니다.")
+            return
+        results = _read_jsonl(jsonl_path)
+        fail_count = len([r for r in results if not r.get("passed")])
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        md_path = output_path.with_suffix(".md")
+        md_path.write_text(
+            build_markdown_report(results, longtext_entries, extracted_entries_by_id),
+            encoding="utf-8",
+        )
+        print(f"[리포트 재생성] {jsonl_path}에서 {len(results)}건 로드 (통과 {len(results) - fail_count}, 실패 {fail_count})")
+        print(f"결과 저장: {output_path}")
+        print(f"미리보기용 리포트: {md_path}")
+        return
 
     # --resume: 기존 jsonl에서 "error" 없이 끝난 item_id는 (통과/실패 여부와 무관하게)
     # 정상적으로 검증이 완료된 것으로 보고 건너뛴다. LLM 호출 자체가 죽었던
@@ -242,56 +332,63 @@ def main():
     results: list[dict] = [r for iid, r in existing_results.items() if iid in done_ids]
     fail_count = len([r for r in results if not r.get("passed")])
 
-    for ex in extracted_entries:
-        item_id = ex["item_id"]
-        entry = longtext_entries.get(item_id)
-        table_markdown = ex.get("table_markdown", "")
+    interrupted = False
+    try:
+        for ex in extracted_entries:
+            item_id = ex["item_id"]
+            entry = longtext_entries.get(item_id)
+            table_markdown = ex.get("table_markdown", "")
 
-        if entry is None:
-            print(f"[경고] {item_id}: 원본 long_text를 찾지 못해 건너뜁니다.")
-            continue
-        if args.resume and item_id in done_ids:
-            print(f"{item_id} 이미 완료됨 -> 건너뜀")
-            continue
+            if entry is None:
+                print(f"[경고] {item_id}: 원본 long_text를 찾지 못해 건너뜁니다.")
+                continue
+            if args.resume and item_id in done_ids:
+                print(f"{item_id} 이미 완료됨 -> 건너뜀")
+                continue
 
-        print(f"{item_id} 검증 중...")
-        try:
-            result = verify_extraction(
-                entry.get("long_text", ""),
-                table_markdown,
-                context_before=entry.get("context_before", ""),
-                context_after=entry.get("context_after", ""),
-                genre=args.genre,
-                model=args.model,
-                ollama_url=args.ollama_url,
-                timeout=args.timeout,
-                max_retries=args.max_retries,
-                hallucination_threshold=args.hallucination_threshold,
-                omission_threshold=args.omission_threshold,
-            )
-        except Exception as e:
-            print(f"    [오류] {item_id} 검증 실패: {e}")
-            result = {
-                "hallucination_check": None,
-                "omission_check": None,
-                "regenerated_long_text": "",
-                "passed": False,
-                "fail_reason": None,
-                "error": str(e),
-            }
+            print(f"{item_id} 검증 중...")
+            try:
+                result = verify_extraction(
+                    entry.get("long_text", ""),
+                    table_markdown,
+                    context_before=entry.get("context_before", ""),
+                    context_after=entry.get("context_after", ""),
+                    genre=args.genre,
+                    model=args.model,
+                    ollama_url=args.ollama_url,
+                    timeout=args.timeout,
+                    max_retries=args.max_retries,
+                    hallucination_threshold=args.hallucination_threshold,
+                    omission_threshold=args.omission_threshold,
+                )
+            except Exception as e:
+                print(f"    [오류] {item_id} 검증 실패: {e}")
+                result = {
+                    "table_markdown": table_markdown,
+                    "hallucination_check": None,
+                    "omission_check": None,
+                    "regenerated_long_text": "",
+                    "passed": False,
+                    "fail_reason": None,
+                    "error": str(e),
+                }
 
-        result["item_id"] = item_id
-        results.append(result)
-        _append_jsonl(jsonl_path, result)  # <- 항목 처리 즉시 디스크에 저장 (핵심)
+            result["item_id"] = item_id
+            results.append(result)
+            _append_jsonl(jsonl_path, result)  # <- 항목 처리 즉시 디스크에 저장 (핵심)
 
-        if result.get("error"):
-            continue
+            if result.get("error"):
+                continue
 
-        if result["passed"]:
-            print("    -> 통과")
-        else:
-            fail_count += 1
-            print(f"    -> 실패: {result['fail_reason']}")
+            if result["passed"]:
+                print("    -> 통과")
+            else:
+                fail_count += 1
+                print(f"    -> 실패: {result['fail_reason']}")
+    except KeyboardInterrupt:
+        interrupted = True
+        print(f"\n[중단됨] Ctrl+C 감지 -- 지금까지 처리된 {len(results)}건으로 리포트를 저장합니다. "
+              f"이어서 하려면 --resume으로 다시 실행하세요.")
 
     # 재개로 쌓였을 수 있는 중복/실패 잔여 라인을 정리하기 위해
     # 최종 결과 기준으로 jsonl을 한 번 깔끔하게 재작성한다.
@@ -302,10 +399,15 @@ def main():
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-    print(f"\n=== 검증 완료 ===")
+    md_path = output_path.with_suffix(".md")
+    md_report = build_markdown_report(results, longtext_entries, extracted_entries_by_id)
+    md_path.write_text(md_report, encoding="utf-8")
+
+    print(f"\n=== {'검증 중단됨' if interrupted else '검증 완료'} ===")
     print(f"통과: {len(results) - fail_count}/{len(results)}, 실패: {fail_count}")
     print(f"중간 저장(재개용): {jsonl_path}")
     print(f"결과 저장: {output_path}")
+    print(f"미리보기용 리포트: {md_path}")
 
 
 if __name__ == "__main__":

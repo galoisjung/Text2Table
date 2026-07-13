@@ -264,6 +264,7 @@ def process_document(
 
     return {
         "chunked": True,
+        "preset_id": preset_id,
         "num_chunks": len(chunks),
         "scan": scan_result,
         "expected_columns": expected_columns,
@@ -276,13 +277,11 @@ def process_document(
 
 # ─────────────────────────────────────────────────────────────
 # 4.5. 중간 결과 저장/로드 (JSONL, 처리 즉시 1건씩 append)
+#      -- roundtrip_verify.py와 동일한 패턴. D는 문서당 LLM 호출이
+#      (스캔 1회 + 청크별 추출 N회) 여러 번이라 중간에 죽었을 때
+#      손실이 더 크므로, 오히려 여기서 더 필요하다.
 # ─────────────────────────────────────────────────────────────
 def _append_jsonl(path: Path, obj: dict) -> None:
-    """
-    결과 1건을 즉시 파일에 append하고 flush+fsync한다.
-    청크가 많은 문서를 처리하다 도중에 죽어도(네트워크 오류, Ctrl+C 등)
-    이미 append된 문서 단위 결과는 디스크에 남아 있다.
-    """
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
         f.flush()
@@ -331,7 +330,7 @@ def main():
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="--output과 같은 폴더의 중간 저장 파일(.jsonl)을 읽어 이미 성공한 item_id는 건너뛰고 이어서 처리",
+        help="--output과 같은 폴더의 중간 저장 파일(.jsonl)을 읽어 이미 처리된 item_id는 건너뛰고 이어서 처리",
     )
     args = parser.parse_args()
 
@@ -351,7 +350,8 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_path.with_suffix(".jsonl")
 
-    # --resume: 기존 jsonl에서 "error" 없이 끝난 item_id는 성공으로 보고 건너뛴다.
+    # --resume: 기존 jsonl에서 error 없이 끝난 item_id는 정상 완료로 보고 건너뛴다.
+    # LLM 호출 도중 죽었던 항목(error 있음)만 다시 시도한다.
     existing_results: dict[str, dict] = {}
     if args.resume and jsonl_path.exists():
         for r in _read_jsonl(jsonl_path):
@@ -359,14 +359,13 @@ def main():
             if iid is not None:
                 existing_results[iid] = r  # 같은 item_id가 여러 번 있으면 마지막 것으로 덮어씀
         done_ids = {iid for iid, r in existing_results.items() if not r.get("error")}
-        print(f"[재개 모드] 기존 결과 {len(existing_results)}건 로드, 성공한 {len(done_ids)}건은 건너뜁니다.")
+        print(f"[재개 모드] 기존 결과 {len(existing_results)}건 로드, 완료된 {len(done_ids)}건은 건너뜁니다.")
     else:
         done_ids = set()
         if jsonl_path.exists():
             print(f"[주의] --resume 없이 실행되어 기존 {jsonl_path.name}을 새로 덮어씁니다.")
             jsonl_path.unlink()
 
-    # 재개 모드에서 이미 성공한 결과는 최종 집계에 그대로 포함시킨다.
     results: list[dict] = [r for iid, r in existing_results.items() if iid in done_ids]
 
     for c in classifications:
@@ -381,7 +380,7 @@ def main():
             print(f"[건너뜀] {item_id}: 폴백 항목 (자유 스키마 경로 필요)")
             continue
         if args.resume and item_id in done_ids:
-            print(f"{item_id} ({preset_id}) 이미 완료됨 -> 건너뜀")
+            print(f"{item_id} 이미 완료됨 -> 건너뜀")
             continue
 
         print(f"{item_id} ({preset_id}) 처리 중...")
@@ -400,11 +399,11 @@ def main():
             )
         except Exception as e:
             print(f"    [오류] {item_id} 처리 실패: {e}")
-            result = {"error": str(e)}
+            result = {"table_markdown": "", "validation": {}, "error": str(e)}
 
         result["item_id"] = item_id
         results.append(result)
-        _append_jsonl(jsonl_path, result)  # <- 문서 처리 즉시 디스크에 저장 (핵심)
+        _append_jsonl(jsonl_path, result)  # <- 항목 처리 즉시 디스크에 저장 (핵심)
 
         if result.get("error"):
             continue
@@ -415,14 +414,14 @@ def main():
         if result.get("merge_conflicts"):
             print(f"    [경고] 병합 충돌 {len(result['merge_conflicts'])}건: {result['merge_conflicts'][:2]}")
 
-    # 재개로 쌓였을 수 있는 중복/실패 잔여 라인을 정리하기 위해
-    # 최종 결과 기준으로 jsonl을 한 번 깔끔하게 재작성한다.
+    # 재개로 쌓였을 수 있는 중복/실패 잔여 라인을 정리하기 위해 최종 결과 기준으로 재작성
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for r in results:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
+
     print(f"\n중간 저장(재개용): {jsonl_path}")
     print(f"결과 저장: {output_path}")
 
