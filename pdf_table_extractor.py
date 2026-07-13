@@ -1,5 +1,5 @@
 """
-0_pdf_table_extractor.py
+pdf_table_extractor.py
 
 pdf2json.py (다른 프로젝트) 를 이식한 버전.
 표를 tidy JSON 대신 Markdown 표 문자열로 추출한다는 점만 다르다.
