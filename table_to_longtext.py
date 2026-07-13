@@ -3,27 +3,31 @@ table_to_longtext.py
 
 [1단계] 표 -> 장문 서술 (Verbalization)
 
-pdf_table_extractor.py 가 생성한 `{stem}_tables.json` (table_markdown 필드 포함)을
-입력으로 받아, 각 표를 로컬 Ollama LLM을 통해 자연스러운 한국어 장문 서술로 변환한다.
+pdf_table_extractor.py 가 생성한 `{stem}_tables.md` (사람이 읽는 통합 마크다운,
+표마다 <!-- table_id: ... --> 주석 포함)를 입력으로 받아, 각 표를 로컬 Ollama LLM을
+통해 자연스러운 한국어 장문 서술로 변환한다.
 
 설계 의도
 ---------
 - PDF -> 표 추출은 pdf_table_extractor.py 가 담당하므로 여기서 재구현하지 않는다.
-- 표가 이미 Markdown 문자열로 와 있으므로, 별도 그룹핑/렌더링 없이 그대로 프롬프트에 삽입한다.
+- LLM에게는 애초부터 순수 Markdown 표 문자열만 전달된다(이전 JSON 기반 버전도 마찬가지였음).
+  이번 변경의 실질적 의미는 "우리 스크립트가 무엇을 파싱해서 구조화하는가"이며,
+  .md 파일 하나를 사람이 검수하는 산출물이자 프로그램 입력으로 동시에 쓸 수 있게 한다.
+- .md 는 사람이 읽기 좋게 만든 포맷이라 표를 식별할 손잡이가 없으므로,
+  pdf_table_extractor.py 가 각 표 앞에 <!-- table_id: ... --> 숨김 주석을 심어 둔다.
 - 표 -> 장문 변환 시 "표의 모든 셀 값이 최소 1회 이상 언급되었는가"를 자동 체크하여,
   이후 라운드트립(장문 -> 표) 검증 단계에서 어느 쪽이 문제인지 구분할 수 있게 한다.
 
 사용 예
 -------
     python table_to_longtext.py --input output_docs --output-dir longtext_out --check-coverage
-    python table_to_longtext.py --input output_docs/report_tables.json
+    python table_to_longtext.py --input output_docs/report_tables.md
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import time
 from pathlib import Path
@@ -40,17 +44,76 @@ DEFAULT_MAX_RETRIES = 3
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. tables.json 로딩
+# 1. tables.md 로딩 & 파싱
 # ─────────────────────────────────────────────────────────────
+_HEADER_RE = re.compile(r'^## Table (\d+) \(page (.+?)\)\s*$', re.MULTILINE)
+_ID_COMMENT_RE = re.compile(r'<!--\s*table_id:\s*(.+?)\s*-->')
+_TABLE_BLOCK_RE = re.compile(r'(^\|.+\|\s*$\n(?:^\|.+\|\s*$\n?)*)', re.MULTILINE)
+
+
+def _dequote(text: str) -> str:
+    """블록인용(>) 표시를 제거하고 빈 줄/구분선을 걸러내며 원래 줄바꿈 구조를 복원."""
+    cleaned = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(">"):
+            line = line[1:].strip()
+        if line and line != "---":
+            cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+def parse_tables_md(md_text: str, source_file: str) -> list[dict]:
+    """
+    pdf_table_extractor.py 가 생성한 `{stem}_tables.md` 텍스트를 파싱하여
+    표 엔트리 리스트로 변환한다. '## Table N (page P)' 헤더로 표를 구분하고,
+    <!-- table_id: ... --> 숨김 주석에서 식별자를, 연속된 '|...|' 줄에서
+    표 본문을, 나머지 텍스트에서 앞/뒤 문맥을 복원한다.
+    """
+    matches = list(_HEADER_RE.finditer(md_text))
+    entries: list[dict] = []
+
+    for i, hm in enumerate(matches):
+        seq, page = hm.group(1), hm.group(2)
+        start = hm.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(md_text)
+        block = md_text[start:end]
+        block = re.sub(r'\n---\s*$', '', block.strip())
+
+        id_m = _ID_COMMENT_RE.search(block)
+        table_id = id_m.group(1) if id_m else None
+        block_wo_id = block[id_m.end():] if id_m else block
+
+        tbl_m = _TABLE_BLOCK_RE.search(block_wo_id)
+        table_markdown = tbl_m.group(1).strip() if tbl_m else ""
+        before_text = block_wo_id[: tbl_m.start()] if tbl_m else block_wo_id
+        after_text = block_wo_id[tbl_m.end():] if tbl_m else ""
+
+        page_number: int | str | None = int(page) if page.isdigit() else (page or None)
+
+        entries.append(
+            {
+                "table_id": table_id,
+                "table_sequence": int(seq),
+                "page_number": page_number,
+                "context_before_table": _dequote(before_text),
+                "context_after_table": _dequote(after_text),
+                "table_markdown": table_markdown,
+                "source_file": source_file,
+            }
+        )
+
+    return entries
+
+
 def load_table_entries(input_path: Path) -> list[dict]:
     """
-    input_path 가 단일 *_tables.json 파일이면 그 파일만, 디렉터리면 하위의
-    모든 *_tables.json 파일을 읽어 표 엔트리 리스트로 합쳐 반환한다.
-    각 엔트리에 source_file(원본 tables.json 경로)을 부여한다.
+    input_path 가 단일 *_tables.md 파일이면 그 파일만, 디렉터리면 하위의
+    모든 *_tables.md 파일을 읽어 표 엔트리 리스트로 합쳐 반환한다.
     """
     files: list[Path]
     if input_path.is_dir():
-        files = sorted(input_path.glob("*_tables.json"))
+        files = sorted(input_path.glob("*_tables.md"))
     elif input_path.is_file():
         files = [input_path]
     else:
@@ -58,18 +121,17 @@ def load_table_entries(input_path: Path) -> list[dict]:
 
     if not files:
         raise FileNotFoundError(
-            f"'{input_path}' 에서 *_tables.json 파일을 찾지 못했습니다. "
+            f"'{input_path}' 에서 *_tables.md 파일을 찾지 못했습니다. "
             "pdf_table_extractor.py 를 먼저 실행했는지 확인하세요."
         )
 
     entries: list[dict] = []
     for f in files:
-        with open(f, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        for entry in data:
-            entry = dict(entry)
-            entry["source_file"] = str(f)
-            entries.append(entry)
+        md_text = f.read_text(encoding="utf-8")
+        parsed = parse_tables_md(md_text, source_file=str(f))
+        if not parsed:
+            print(f"    [경고] '{f}' 에서 표를 찾지 못했습니다 (형식이 다른 것 같습니다).")
+        entries.extend(parsed)
 
     return entries
 
@@ -118,22 +180,24 @@ def call_ollama_generate(
             if not text:
                 raise ValueError("Ollama가 빈 응답을 반환했습니다.")
             return text
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response is not None else None
-            if status is not None and status < 500:
-                # 4xx(요청 자체가 잘못됨)는 재시도해도 결과가 같으므로 즉시 실패시킨다.
-                raise
-            # 5xx(502/503/504 등)는 업스트림(예: -cloud 모델의 원격 추론 백엔드)의
-            # 일시적 문제인 경우가 많으므로 재시도 대상에 포함한다.
-            last_error = e
-            wait = 2 ** (attempt - 1)
-            print(f"    [재시도 {attempt}/{max_retries}] HTTP {status} 오류 -> {wait}초 대기 후 재시도")
-            time.sleep(wait)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, ValueError) as e:
             last_error = e
             wait = 2 ** (attempt - 1)
             print(f"    [재시도 {attempt}/{max_retries}] {e} -> {wait}초 대기 후 재시도")
             time.sleep(wait)
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is not None and 500 <= status < 600:
+                # 5xx: 게이트웨이/서버 쪽 일시적 오류 -> 재시도 대상
+                # (특히 -cloud 모델은 로컬이 아니라 Ollama 클라우드로 요청이 넘어가므로
+                # 502 Bad Gateway 같은 오류가 일시적으로 발생할 수 있다)
+                last_error = e
+                wait = 2 ** (attempt - 1)
+                print(f"    [재시도 {attempt}/{max_retries}] HTTP {status} -> {wait}초 대기 후 재시도")
+                time.sleep(wait)
+            else:
+                # 4xx 등 클라이언트 오류는 재시도해도 소용없으므로 즉시 중단
+                raise
 
     raise RuntimeError(f"Ollama 호출이 {max_retries}회 모두 실패했습니다: {last_error}")
 
@@ -206,40 +270,6 @@ def check_value_coverage(long_text: str, values: list[str]) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# 4.5. 중간 결과 저장/로드 (JSONL, 처리 즉시 1건씩 append)
-# ─────────────────────────────────────────────────────────────
-def _append_jsonl(path: Path, obj: dict) -> None:
-    """
-    결과 1건을 즉시 파일에 append하고 flush+fsync한다.
-    루프 도중 프로세스가 죽거나(502 반복, Ctrl+C, OOM 등) 해도
-    이미 append된 항목들은 디스크에 남아 있다.
-    """
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass  # 일부 파일시스템/환경은 fsync를 지원하지 않음 -> 무시
-
-
-def _read_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    results = []
-    with open(path, encoding="utf-8") as f:
-        for line_no, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                results.append(json.loads(line))
-            except json.JSONDecodeError:
-                print(f"    [경고] {path.name} {line_no}번째 줄 파싱 실패 -> 무시")
-    return results
-
-
-# ─────────────────────────────────────────────────────────────
 # 5. 메인 처리
 # ─────────────────────────────────────────────────────────────
 def process_table_entry(
@@ -292,9 +322,9 @@ def process_table_entry(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="pdf_table_extractor.py의 *_tables.json(table_markdown)을 읽어 표를 장문 서술로 변환합니다."
+        description="pdf_table_extractor.py의 *_tables.md를 읽어 표를 장문 서술로 변환합니다."
     )
-    parser.add_argument("--input", required=True, help="*_tables.json 파일 또는 이를 포함한 디렉터리")
+    parser.add_argument("--input", required=True, help="*_tables.md 파일 또는 이를 포함한 디렉터리")
     parser.add_argument("--output-dir", default="longtext_output", help="결과 저장 디렉터리")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Ollama 모델명")
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help="Ollama 서버 주소")
@@ -311,11 +341,6 @@ def main():
         action="store_true",
         help="생성된 장문에 표의 모든 값이 포함되었는지 느슨하게 검증",
     )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="output-dir의 기존 tables_longtext.jsonl을 읽어 이미 성공한 table_id는 건너뛰고 이어서 처리",
-    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -325,36 +350,9 @@ def main():
     entries = load_table_entries(input_path)
     print(f"총 {len(entries)}개의 표 엔트리를 로드했습니다.")
 
-    jsonl_path = output_dir / "tables_longtext.jsonl"
-
-    # --resume: 기존 jsonl에서 이미 "성공"한 table_id는 건너뛴다.
-    # (실패했던 항목은 done_ids에 포함시키지 않아 이번 실행에서 다시 시도된다.)
-    existing_results: dict[str, dict] = {}
-    if args.resume and jsonl_path.exists():
-        for r in _read_jsonl(jsonl_path):
-            tid = r.get("table_id")
-            if tid is not None:
-                existing_results[tid] = r  # 같은 table_id가 여러 번 있으면 마지막 것으로 덮어씀
-        done_ids = {
-            tid for tid, r in existing_results.items() if r.get("long_text") and not r.get("error")
-        }
-        print(f"[재개 모드] 기존 결과 {len(existing_results)}건 로드, 성공한 {len(done_ids)}건은 건너뜁니다.")
-    else:
-        done_ids = set()
-        if jsonl_path.exists():
-            print(f"[주의] --resume 없이 실행되어 기존 {jsonl_path.name}을 새로 덮어씁니다.")
-            jsonl_path.unlink()
-
-    # 재개 모드에서 이미 성공한 결과는 최종 집계에 그대로 포함시킨다.
-    results: list[dict] = [r for tid, r in existing_results.items() if tid in done_ids]
-
+    results = []
     for idx, entry in enumerate(entries, 1):
-        table_id = entry.get("table_id")
-        if args.resume and table_id in done_ids:
-            print(f"[{idx}/{len(entries)}] table_id={table_id} 이미 완료됨 -> 건너뜀")
-            continue
-
-        print(f"[{idx}/{len(entries)}] table_id={table_id} 처리 중...")
+        print(f"[{idx}/{len(entries)}] table_id={entry.get('table_id')} 처리 중...")
         try:
             result = process_table_entry(
                 entry,
@@ -365,6 +363,7 @@ def main():
                 genre=args.genre,
                 check_coverage=args.check_coverage,
             )
+            results.append(result)
 
             if args.check_coverage and "coverage" in result:
                 cov = result["coverage"]
@@ -375,21 +374,14 @@ def main():
                         f"{' 외 다수' if len(cov['missing_values']) > 5 else ''}"
                     )
         except Exception as e:
-            print(f"    [오류] table_id={table_id} 처리 실패: {e}")
-            result = {
-                "table_id": table_id,
-                "source_file": entry.get("source_file"),
-                "error": str(e),
-            }
-
-        results.append(result)
-        _append_jsonl(jsonl_path, result)  # <- 항목 처리 즉시 디스크에 저장 (핵심)
-
-    # 재개로 쌓였을 수 있는 중복/실패 잔여 라인을 정리하기 위해
-    # 최종 결과 기준으로 jsonl을 한 번 깔끔하게 재작성한다.
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for r in results:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            print(f"    [오류] table_id={entry.get('table_id')} 처리 실패: {e}")
+            results.append(
+                {
+                    "table_id": entry.get("table_id"),
+                    "source_file": entry.get("source_file"),
+                    "error": str(e),
+                }
+            )
 
     out_json_path = output_dir / "tables_longtext.json"
     with open(out_json_path, "w", encoding="utf-8") as f:
@@ -404,7 +396,6 @@ def main():
 
     success_count = len([r for r in results if r.get("long_text")])
     print(f"\n완료: {success_count}/{len(results)}개 표 서술 생성")
-    print(f"중간 저장(재개용): {jsonl_path}")
     print(f"결과 저장: {out_json_path}")
     print(f"미리보기용 텍스트: {out_txt_path}")
 
