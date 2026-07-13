@@ -400,14 +400,22 @@ def process_single_pdf(pdf_path: Path, output_dir: Path):
             json.dump(final_table_outputs, f, ensure_ascii=False, indent=2)
 
         # 사람이 바로 읽을 수 있는 통합 마크다운
+        # (table_id를 HTML 주석으로 숨겨 넣어, 이 .md 파일 자체를 다시 구조화된 입력으로 파싱할 수 있게 함)
         md_lines = [f"# {pdf_path.name}\n"]
         for entry in final_table_outputs:
-            md_lines.append(f"## Table {entry['table_sequence']} (page {entry['page_number']})\n")
+            md_lines.append(f"## Table {entry['table_sequence']} (page {entry['page_number']})")
+            md_lines.append(f"<!-- table_id: {entry['table_id']} -->\n")
             if entry["context_before_table"]:
-                md_lines.append(f"> {entry['context_before_table']}\n")
+                context_before_quoted = "\n".join(
+                    f"> {line}" for line in entry["context_before_table"].splitlines()
+                )
+                md_lines.append(context_before_quoted + "\n")
             md_lines.append(entry["table_markdown"] + "\n")
             if entry["context_after_table"]:
-                md_lines.append(f"> {entry['context_after_table']}\n")
+                context_after_quoted = "\n".join(
+                    f"> {line}" for line in entry["context_after_table"].splitlines()
+                )
+                md_lines.append(context_after_quoted + "\n")
             md_lines.append("---\n")
         (output_dir / f"{stem}_tables.md").write_text("\n".join(md_lines), encoding="utf-8")
 

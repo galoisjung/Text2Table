@@ -3,20 +3,25 @@ table_to_longtext.py
 
 [1단계] 표 -> 장문 서술 (Verbalization)
 
-pdf_table_extractor.py 가 생성한 `{stem}_tables.json` (table_markdown 필드 포함)을
-입력으로 받아, 각 표를 로컬 Ollama LLM을 통해 자연스러운 한국어 장문 서술로 변환한다.
+pdf_table_extractor.py 가 생성한 `{stem}_tables.md` (사람이 읽는 통합 마크다운,
+표마다 <!-- table_id: ... --> 주석 포함)를 입력으로 받아, 각 표를 로컬 Ollama LLM을
+통해 자연스러운 한국어 장문 서술로 변환한다.
 
 설계 의도
 ---------
 - PDF -> 표 추출은 pdf_table_extractor.py 가 담당하므로 여기서 재구현하지 않는다.
-- 표가 이미 Markdown 문자열로 와 있으므로, 별도 그룹핑/렌더링 없이 그대로 프롬프트에 삽입한다.
+- LLM에게는 애초부터 순수 Markdown 표 문자열만 전달된다(이전 JSON 기반 버전도 마찬가지였음).
+  이번 변경의 실질적 의미는 "우리 스크립트가 무엇을 파싱해서 구조화하는가"이며,
+  .md 파일 하나를 사람이 검수하는 산출물이자 프로그램 입력으로 동시에 쓸 수 있게 한다.
+- .md 는 사람이 읽기 좋게 만든 포맷이라 표를 식별할 손잡이가 없으므로,
+  pdf_table_extractor.py 가 각 표 앞에 <!-- table_id: ... --> 숨김 주석을 심어 둔다.
 - 표 -> 장문 변환 시 "표의 모든 셀 값이 최소 1회 이상 언급되었는가"를 자동 체크하여,
   이후 라운드트립(장문 -> 표) 검증 단계에서 어느 쪽이 문제인지 구분할 수 있게 한다.
 
 사용 예
 -------
     python table_to_longtext.py --input output_docs --output-dir longtext_out --check-coverage
-    python table_to_longtext.py --input output_docs/report_tables.json
+    python table_to_longtext.py --input output_docs/report_tables.md
 """
 
 from __future__ import annotations
@@ -39,17 +44,76 @@ DEFAULT_MAX_RETRIES = 3
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. tables.json 로딩
+# 1. tables.md 로딩 & 파싱
 # ─────────────────────────────────────────────────────────────
+_HEADER_RE = re.compile(r'^## Table (\d+) \(page (.+?)\)\s*$', re.MULTILINE)
+_ID_COMMENT_RE = re.compile(r'<!--\s*table_id:\s*(.+?)\s*-->')
+_TABLE_BLOCK_RE = re.compile(r'(^\|.+\|\s*$\n(?:^\|.+\|\s*$\n?)*)', re.MULTILINE)
+
+
+def _dequote(text: str) -> str:
+    """블록인용(>) 표시를 제거하고 빈 줄/구분선을 걸러내며 원래 줄바꿈 구조를 복원."""
+    cleaned = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(">"):
+            line = line[1:].strip()
+        if line and line != "---":
+            cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+def parse_tables_md(md_text: str, source_file: str) -> list[dict]:
+    """
+    pdf_table_extractor.py 가 생성한 `{stem}_tables.md` 텍스트를 파싱하여
+    표 엔트리 리스트로 변환한다. '## Table N (page P)' 헤더로 표를 구분하고,
+    <!-- table_id: ... --> 숨김 주석에서 식별자를, 연속된 '|...|' 줄에서
+    표 본문을, 나머지 텍스트에서 앞/뒤 문맥을 복원한다.
+    """
+    matches = list(_HEADER_RE.finditer(md_text))
+    entries: list[dict] = []
+
+    for i, hm in enumerate(matches):
+        seq, page = hm.group(1), hm.group(2)
+        start = hm.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(md_text)
+        block = md_text[start:end]
+        block = re.sub(r'\n---\s*$', '', block.strip())
+
+        id_m = _ID_COMMENT_RE.search(block)
+        table_id = id_m.group(1) if id_m else None
+        block_wo_id = block[id_m.end():] if id_m else block
+
+        tbl_m = _TABLE_BLOCK_RE.search(block_wo_id)
+        table_markdown = tbl_m.group(1).strip() if tbl_m else ""
+        before_text = block_wo_id[: tbl_m.start()] if tbl_m else block_wo_id
+        after_text = block_wo_id[tbl_m.end():] if tbl_m else ""
+
+        page_number: int | str | None = int(page) if page.isdigit() else (page or None)
+
+        entries.append(
+            {
+                "table_id": table_id,
+                "table_sequence": int(seq),
+                "page_number": page_number,
+                "context_before_table": _dequote(before_text),
+                "context_after_table": _dequote(after_text),
+                "table_markdown": table_markdown,
+                "source_file": source_file,
+            }
+        )
+
+    return entries
+
+
 def load_table_entries(input_path: Path) -> list[dict]:
     """
-    input_path 가 단일 *_tables.json 파일이면 그 파일만, 디렉터리면 하위의
-    모든 *_tables.json 파일을 읽어 표 엔트리 리스트로 합쳐 반환한다.
-    각 엔트리에 source_file(원본 tables.json 경로)을 부여한다.
+    input_path 가 단일 *_tables.md 파일이면 그 파일만, 디렉터리면 하위의
+    모든 *_tables.md 파일을 읽어 표 엔트리 리스트로 합쳐 반환한다.
     """
     files: list[Path]
     if input_path.is_dir():
-        files = sorted(input_path.glob("*_tables.json"))
+        files = sorted(input_path.glob("*_tables.md"))
     elif input_path.is_file():
         files = [input_path]
     else:
@@ -57,18 +121,17 @@ def load_table_entries(input_path: Path) -> list[dict]:
 
     if not files:
         raise FileNotFoundError(
-            f"'{input_path}' 에서 *_tables.json 파일을 찾지 못했습니다. "
+            f"'{input_path}' 에서 *_tables.md 파일을 찾지 못했습니다. "
             "pdf_table_extractor.py 를 먼저 실행했는지 확인하세요."
         )
 
     entries: list[dict] = []
     for f in files:
-        with open(f, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        for entry in data:
-            entry = dict(entry)
-            entry["source_file"] = str(f)
-            entries.append(entry)
+        md_text = f.read_text(encoding="utf-8")
+        parsed = parse_tables_md(md_text, source_file=str(f))
+        if not parsed:
+            print(f"    [경고] '{f}' 에서 표를 찾지 못했습니다 (형식이 다른 것 같습니다).")
+        entries.extend(parsed)
 
     return entries
 
@@ -246,9 +309,9 @@ def process_table_entry(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="pdf_table_extractor.py의 *_tables.json(table_markdown)을 읽어 표를 장문 서술로 변환합니다."
+        description="pdf_table_extractor.py의 *_tables.md를 읽어 표를 장문 서술로 변환합니다."
     )
-    parser.add_argument("--input", required=True, help="*_tables.json 파일 또는 이를 포함한 디렉터리")
+    parser.add_argument("--input", required=True, help="*_tables.md 파일 또는 이를 포함한 디렉터리")
     parser.add_argument("--output-dir", default="longtext_output", help="결과 저장 디렉터리")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Ollama 모델명")
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help="Ollama 서버 주소")
