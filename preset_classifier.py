@@ -1,5 +1,5 @@
 """
-1_preset_classifier.py
+preset_classifier.py
 
 [C 단계] 장르(축) 분류 + 프리셋 선택
 
@@ -17,8 +17,8 @@
 
 사용 예
 -------
-    python 1_preset_classifier.py --input tables_longtext.json --field long_text
-    python 1_preset_classifier.py --input some_free_text.txt
+    python preset_classifier.py --input tables_longtext.json --field long_text
+    python preset_classifier.py --input some_free_text.txt
 """
 
 from __future__ import annotations

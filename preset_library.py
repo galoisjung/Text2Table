@@ -15,7 +15,7 @@ preset_library.py
 - 표 병합 셀/다단헤더 같은 구조적 복잡도(concise/nested/multivalued/split)는
   별도의 preset이 아니라 전처리 플래그로 다룬다 (여기서는 자리만 마련해둠).
 
-이 파일은 순수 데이터 + 결정 로직만 담고, LLM 호출은 1_preset_classifier.py 에서 한다.
+이 파일은 순수 데이터 + 결정 로직만 담고, LLM 호출은 preset_classifier.py 에서 한다.
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ class Preset:
     extension_budget_default: int | None  # None = 확장 불가(구조상 의미 없음)
     validation_rule: str
     few_shot: list[dict] = field(default_factory=list)
+    key_uniqueness_columns: list[str] = field(default_factory=list)
 
 
 PRESETS: dict[str, Preset] = {
@@ -59,6 +60,7 @@ PRESETS: dict[str, Preset] = {
         ],
         extension_budget_default=None,  # 열이 늘어날 구조가 아님
         validation_rule="속성명은 표 내에서 서로 중복되지 않아야 함",
+        key_uniqueness_columns=["속성명"],
         few_shot=[{
             "text": "평가계약일자는 2024년 6월 19일이며",
             "row": "| 평가계약일자 | 2024년 6월 19일 |",
@@ -78,6 +80,7 @@ PRESETS: dict[str, Preset] = {
         ],
         extension_budget_default=4,
         validation_rule="시점은 시간순 정렬 가능해야 함 (날짜/순번 등)",
+        key_uniqueness_columns=[],  # 동일 시점에 여러 사건이 있을 수 있어 유일성 강제 안 함
         few_shot=[{
             "text": "2024년 3월 첫째 주, 주인공은 회사를 그만두고 유럽으로 떠났다.",
             "row": "| 2024-03 | 퇴사 후 유럽으로 출국 |",
@@ -96,6 +99,7 @@ PRESETS: dict[str, Preset] = {
         ],
         extension_budget_default=6,  # 1차 스캔 결과에 따라 동적으로 조정 권장
         validation_rule="개체명은 문서 내에서 고유해야 함 (별칭 통합 필요)",
+        key_uniqueness_columns=["개체명"],
         few_shot=[{
             "text": "양도인인 주식회사 에이피에스(대표이사 정기로, 설립연월일 1996년 08월 29일)는...",
             "row": "| 주식회사 에이피에스 | 정기로 | 1996-08-29 | ... |",
@@ -115,6 +119,7 @@ PRESETS: dict[str, Preset] = {
         ],
         extension_budget_default=6,
         validation_rule="(시점, 개체명) 복합키가 유일해야 함 (동일 시점에 여러 개체 가능)",
+        key_uniqueness_columns=["시점", "개체명"],
         few_shot=[{
             "text": "2024-06-17에 웨스트라이즈는 9000000주를 40500원에 양수도하였다.",
             "row": "| 2024-06-17 | 웨스트라이즈 | 9000000 | 40500 |",
@@ -135,6 +140,7 @@ PRESETS: dict[str, Preset] = {
         extension_budget_default=None,  # 속성이 정의상 1개뿐이라 확장 불필요
         validation_rule="값 컬럼은 보통 통제 어휘(예: 이행함/미이행)에 가까움. "
                          "자유 서술이면 horizontal_relational_static 재검토",
+        key_uniqueness_columns=["항목"],
         few_shot=[{
             "text": "점검항목 1 '정보의 원천'에 대해서는 점검결과는 이행함이다.",
             "row": "| 정보의 원천 | 이행함 |",
