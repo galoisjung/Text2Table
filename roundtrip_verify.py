@@ -47,6 +47,8 @@ from table_to_longtext import (
     check_value_coverage,
     extract_cell_values_from_markdown,
 )
+from preset_library import PRESETS
+from schema_extract import parse_markdown_table
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_MODEL = "gpt-oss:120b-cloud"
@@ -84,6 +86,45 @@ def extract_salient_tokens(text: str) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────
+# 1.5. 환각 체크 대상 값 추출 (라벨/row_key 컬럼 제외)
+# ─────────────────────────────────────────────────────────────
+def extract_hallucination_check_values(table_markdown: str, preset_id: str | None) -> list[str]:
+    """
+    표의 셀 값 중 "값"에 해당하는 컬럼만 환각 체크 대상으로 추린다.
+
+    vertical_entity의 "속성명", listing의 "항목", horizontal_relational_*의
+    "개체명"처럼 role="row_key"인 컬럼은 원문을 그대로 옮긴 게 아니라 A-2가
+    문서를 보고 이름 붙인 서술형 라벨이다. verbalization 과정에서 자연스럽게
+    의역되므로 원문과 글자 그대로 일치할 거라 기대할 수 없다 -- 포함시키면
+    정상적인 표까지 오탐(false positive)으로 실패 처리된다.
+
+    preset_id를 모르거나 preset을 못 찾으면(예: 자유 스키마 폴백) 안전하게
+    전체 컬럼을 그대로 검사한다 (기존 동작으로 폴백).
+    """
+    preset = PRESETS.get(preset_id) if preset_id else None
+    if preset is None:
+        return extract_cell_values_from_markdown(table_markdown)
+
+    exclude_columns = {c.name for c in preset.core_columns if c.role == "row_key"}
+    if not exclude_columns:
+        return extract_cell_values_from_markdown(table_markdown)
+
+    header, rows = parse_markdown_table(table_markdown)
+    if not header:
+        return []
+
+    values: list[str] = []
+    for row in rows:
+        for col, val in row.items():
+            if col in exclude_columns:
+                continue
+            val = (val or "").strip()
+            if val and val != "-":
+                values.append(val)
+    return values
+
+
+# ─────────────────────────────────────────────────────────────
 # 2. 검증 오케스트레이션
 # ─────────────────────────────────────────────────────────────
 def verify_extraction(
@@ -92,6 +133,7 @@ def verify_extraction(
     context_before: str = "",
     context_after: str = "",
     genre: str = "informative",
+    preset_id: str | None = None,
     model: str = DEFAULT_MODEL,
     ollama_url: str = DEFAULT_OLLAMA_URL,
     timeout: int = DEFAULT_TIMEOUT,
@@ -109,8 +151,8 @@ def verify_extraction(
             "fail_reason": "표가 비어있음",
         }
 
-    # ── 1) 환각 체크: 표의 값이 원문에 실제로 있었는가 ──
-    table_values = extract_cell_values_from_markdown(candidate_table_markdown)
+    # ── 1) 환각 체크: 표의 값이 원문에 실제로 있었는가 (라벨 컬럼 제외) ──
+    table_values = extract_hallucination_check_values(candidate_table_markdown, preset_id)
     hallucination_check = check_value_coverage(original_long_text, table_values)
 
     # ── 2) 누락 체크: 표 -> 장문 복원 -> 원문의 사실성 토큰이 남아있는가 ──
@@ -354,6 +396,7 @@ def main():
                     context_before=entry.get("context_before", ""),
                     context_after=entry.get("context_after", ""),
                     genre=args.genre,
+                    preset_id=ex.get("preset_id"),
                     model=args.model,
                     ollama_url=args.ollama_url,
                     timeout=args.timeout,

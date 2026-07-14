@@ -245,18 +245,58 @@ def build_verbalization_prompt(
 """
 
 
+# 하이픈처럼 보이지만 코드포인트가 다른 문자들 (LLM이 날짜/음수 표기에 흔히 섞어 씀).
+# 정규화 없이 비교하면 "2024-06-17"(U+002D)과 "2024‑06‑17"(U+2011, non-breaking hyphen)이
+# 육안으론 똑같아 보여도 문자열 비교에서는 다른 값으로 취급되어 실제로 존재하는 값이
+# "누락"으로 오탐된다.
+_DASH_VARIANTS_RE = re.compile("[\u2010\u2011\u2012\u2013\u2014\u2212]")
+
+
+def _normalize_for_comparison(s: str) -> str:
+    s = re.sub(r"[,\s]", "", s)
+    s = _DASH_VARIANTS_RE.sub("-", s)
+    return s
+
+
+_DATE_LIKE_RE = re.compile(
+    r"^\d{4}[-./]\d{1,2}[-./]\d{1,2}$|^\d{4}년\s*\d{1,2}월\s*\d{1,2}일$"
+)
+
+
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D", "", s)
+
+
+def _value_covered(value: str, normalized_text: str, text_digits: str) -> bool:
+    v_norm = _normalize_for_comparison(value)
+    if v_norm and v_norm in normalized_text:
+        return True
+    # 날짜는 "1996년 08월 29일"과 "1996-08-29"처럼 표기가 달라도 같은 날짜일 수 있다.
+    # 일반 문자열 비교로 실패했을 때만, 숫자만 남긴 형태로 한 번 더 확인한다
+    # (임의의 숫자값까지 이 fallback을 타면 우연한 부분 일치가 생길 수 있으므로
+    # 날짜처럼 보이는 값에만 적용한다).
+    if _DATE_LIKE_RE.match(value.strip()):
+        v_digits = _digits_only(value)
+        if len(v_digits) >= 6 and v_digits in text_digits:
+            return True
+    return False
+
+
 def check_value_coverage(long_text: str, values: list[str]) -> dict:
     """
     표의 각 값이 생성된 장문에 실제로 등장하는지 확인.
-    쉼표/공백 차이는 무시하고 느슨하게 비교한다(완벽한 검증은 2단계 라운드트립에서 수행).
+    쉼표/공백 차이와 하이픈류 문자 변형은 무시하고 느슨하게 비교하며,
+    날짜처럼 보이는 값은 표기 형식(하이픈 vs "년/월/일")이 달라도 숫자만
+    같으면 동일한 값으로 인정한다 (완벽한 검증은 2단계 라운드트립에서 수행).
     """
-    normalized_text = re.sub(r"[,\s]", "", long_text)
+    normalized_text = _normalize_for_comparison(long_text)
+    text_digits = _digits_only(long_text)
     missing = []
     for v in values:
-        v_norm = re.sub(r"[,\s]", "", str(v))
-        if not v_norm:
+        v_str = str(v)
+        if not v_str.strip():
             continue
-        if v_norm not in normalized_text:
+        if not _value_covered(v_str, normalized_text, text_digits):
             missing.append(v)
 
     total = len([v for v in values if str(v).strip()])

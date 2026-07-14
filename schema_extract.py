@@ -195,6 +195,22 @@ def validate_extraction(
             else:
                 seen[key] = 1
 
+    # row_key 컬럼이 3행 이상인데 값이 사실상 하나뿐이면(예: "개체명"이 매 행
+    # "양도대상주식"으로 동일), 이건 "같은 개체가 반복"이 아니라 애초에 이 표의
+    # 진짜 row_unit이 preset이 가정한 것과 다를 가능성이 높다는 신호다 --
+    # duplicate_keys 경고만으로는 원인이 안 드러나므로 별도로 명시한다.
+    row_unit_mismatch_warning = None
+    for col in key_cols_present:
+        values_in_col = [r.get(col, "").strip() for r in rows]
+        unique_values = {v for v in values_in_col if v}
+        if len(rows) >= 3 and len(unique_values) == 1:
+            row_unit_mismatch_warning = (
+                f"'{col}' 컬럼이 {len(rows)}개 행 전부 동일한 값('{next(iter(unique_values))}')"
+                f"입니다. 이 preset의 row_unit 가정이 이 표와 안 맞을 수 있습니다 "
+                f"(실제 행 기준은 다른 컬럼일 가능성)."
+            )
+            break
+
     completeness: dict[str, float] = {}
     for col in header:
         if not rows:
@@ -215,6 +231,7 @@ def validate_extraction(
         "duplicate_keys": duplicate_keys,
         "column_completeness": completeness,
         "low_completeness_columns": low_completeness_columns,
+        "row_unit_mismatch_warning": row_unit_mismatch_warning,
     }
 
 
@@ -323,6 +340,8 @@ def main():
             print(f"    [경고] row_key 중복: {v['duplicate_keys'][:3]}")
         if v.get("low_completeness_columns"):
             print(f"    [경고] 채움 비율 낮은 컬럼: {v['low_completeness_columns']}")
+        if v.get("row_unit_mismatch_warning"):
+            print(f"    [경고] {v['row_unit_mismatch_warning']}")
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)

@@ -510,6 +510,10 @@ def main():
               f"{v.get('row_count', 0)}행")
         if result.get("merge_conflicts"):
             print(f"    [경고] 병합 충돌 {len(result['merge_conflicts'])}건: {result['merge_conflicts'][:2]}")
+        if v.get("duplicate_keys"):
+            print(f"    [경고] row_key 중복 {len(v['duplicate_keys'])}건: {v['duplicate_keys'][:3]}")
+        if v.get("row_unit_mismatch_warning"):
+            print(f"    [경고] {v['row_unit_mismatch_warning']}")
 
     # 재개로 쌓였을 수 있는 중복/실패 잔여 라인을 정리하기 위해 최종 결과 기준으로 재작성
     with open(jsonl_path, "w", encoding="utf-8") as f:
