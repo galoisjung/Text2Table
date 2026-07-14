@@ -72,6 +72,7 @@ def convert_text_to_table(
     chars_per_token: float | None = None,
     chunk_overlap_ratio: float | None = None,
     schema_scan_sample_chunks: int | None = None,
+    quality_chunk_tokens: int | None = None,
 ) -> dict:
     llm_kwargs = {"model": model, "ollama_url": ollama_url, "timeout": timeout, "max_retries": max_retries}
 
@@ -98,6 +99,7 @@ def convert_text_to_table(
             "chars_per_token": chars_per_token,
             "chunk_overlap_ratio": chunk_overlap_ratio,
             "schema_scan_sample_chunks": schema_scan_sample_chunks,
+            "quality_chunk_tokens": quality_chunk_tokens,
         }.items() if v is not None
     }
     extraction = process_document(
@@ -184,6 +186,12 @@ def main():
         help="A-1 스캔에 쓸 앞부분 청크 개수. 0 이하로 주면 모든 청크를 개별 스캔 후 "
              "합산한다 (문서 전체 대상 스캔, 호출 수는 늘어남). 기본값은 D의 기본값(2)."
     )
+    parser.add_argument(
+        "--quality-chunk-tokens", type=int, default=None,
+        help="지정하면 컨텍스트 오버플로 여부와 무관하게 이 크기로 청크를 강제 분할한다 "
+             "(lost-in-the-middle/context rot 완화용). 미지정 시 기존처럼 오버플로 위험이 "
+             "있을 때만 청크한다."
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -205,6 +213,7 @@ def main():
         chars_per_token=args.chars_per_token,
         chunk_overlap_ratio=args.chunk_overlap_ratio,
         schema_scan_sample_chunks=args.schema_scan_sample_chunks,
+        quality_chunk_tokens=args.quality_chunk_tokens,
     )
 
     output_md = Path(args.output) if args.output else input_path.with_suffix(".table.md")

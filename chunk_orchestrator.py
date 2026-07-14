@@ -43,6 +43,8 @@ DEFAULT_RESERVED_TOKENS = 6000  # 프롬프트 템플릿 + few_shot + 지시문 
 DEFAULT_CHARS_PER_TOKEN = 2.0   # 한국어 텍스트 근사치 (정확한 토크나이저 없을 때)
 DEFAULT_CHUNK_OVERLAP_RATIO = 0.1
 DEFAULT_SCHEMA_SCAN_SAMPLE_CHUNKS = 2
+DEFAULT_QUALITY_CHUNK_TOKENS = None  # None = 오버플로 예산과 동일(기존 동작). 값을 주면 그보다 훨씬
+                                      # 보수적으로 청크 크기를 강제 (lost-in-the-middle/context rot 완화용)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -56,6 +58,7 @@ def available_token_budget(
     model_context_tokens: int = DEFAULT_MODEL_CONTEXT_TOKENS,
     reserved_tokens: int = DEFAULT_RESERVED_TOKENS,
 ) -> int:
+    """컨텍스트 오버플로를 막기 위한 절대 상한. 절대 이 값을 넘겨 한 번에 넣지 않는다."""
     return max(model_context_tokens - reserved_tokens, 1)
 
 
@@ -67,6 +70,40 @@ def needs_chunking(
 ) -> bool:
     budget = available_token_budget(model_context_tokens, reserved_tokens)
     return estimate_tokens(text, chars_per_token) > budget
+
+
+def resolve_chunk_budget(
+    text: str,
+    model_context_tokens: int = DEFAULT_MODEL_CONTEXT_TOKENS,
+    reserved_tokens: int = DEFAULT_RESERVED_TOKENS,
+    chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
+    quality_chunk_tokens: int | None = DEFAULT_QUALITY_CHUNK_TOKENS,
+) -> tuple[bool, int]:
+    """
+    "오버플로 방지 상한"과 "품질 목표 청크 크기"를 분리해서 청크 여부/크기를 결정한다.
+
+    - quality_chunk_tokens=None: 기존 동작과 동일. 오버플로 예산을 넘을 때만 청크하고,
+      청크 크기도 그 예산 그대로 쓴다.
+    - quality_chunk_tokens 지정: lost-in-the-middle/context rot 완화를 위해 그 값을
+      청크 크기로 쓴다. 텍스트가 이 값보다 길면 -- 설사 오버플로 예산 안에 여유 있게
+      들어가더라도 -- 청크로 나눈다. 다만 quality_chunk_tokens가 오버플로 예산보다
+      크면 의미가 없으므로 오버플로 예산으로 clamp한다.
+    """
+    overflow_budget = available_token_budget(model_context_tokens, reserved_tokens)
+
+    if quality_chunk_tokens is None:
+        chunk_budget = overflow_budget
+    else:
+        chunk_budget = quality_chunk_tokens
+        if chunk_budget > overflow_budget:
+            print(
+                f"    [경고] --quality-chunk-tokens({quality_chunk_tokens})가 컨텍스트 예산"
+                f"({overflow_budget})보다 커서 예산 값으로 낮춥니다."
+            )
+            chunk_budget = overflow_budget
+
+    should_chunk = estimate_tokens(text, chars_per_token) > chunk_budget
+    return should_chunk, chunk_budget
 
 
 # ─────────────────────────────────────────────────────────────
@@ -240,6 +277,7 @@ def process_document(
     chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
     chunk_overlap_ratio: float = DEFAULT_CHUNK_OVERLAP_RATIO,
     schema_scan_sample_chunks: int = DEFAULT_SCHEMA_SCAN_SAMPLE_CHUNKS,
+    quality_chunk_tokens: int | None = DEFAULT_QUALITY_CHUNK_TOKENS,
 ) -> dict:
     preset = PRESETS.get(preset_id)
     if preset is None:
@@ -252,10 +290,12 @@ def process_document(
         }.items() if v is not None
     }
 
-    budget = available_token_budget(model_context_tokens, reserved_tokens)
+    should_chunk, budget = resolve_chunk_budget(
+        full_text, model_context_tokens, reserved_tokens, chars_per_token, quality_chunk_tokens
+    )
 
     # ── 청크가 필요 없는 경우: 지금까지 만든 A-1/A-2를 그대로 사용 ──
-    if not needs_chunking(full_text, model_context_tokens, reserved_tokens, chars_per_token):
+    if not should_chunk:
         scan_result = (
             scan_schema(preset_id, full_text, **llm_kwargs)
             if preset.extension_budget_default is not None
@@ -270,7 +310,8 @@ def process_document(
 
     # ── 청크 분할 ──
     chunks = chunk_text(full_text, budget, chunk_overlap_ratio, chars_per_token)
-    print(f"    [D] 문서를 {len(chunks)}개 청크로 분할 (예산: 청크당 약 {budget} 토큰)")
+    reason = "품질 목표" if quality_chunk_tokens is not None else "컨텍스트 예산 초과"
+    print(f"    [D] 문서를 {len(chunks)}개 청크로 분할 ({reason} 기준, 청크당 약 {budget} 토큰)")
 
     # ── 스키마는 대표 청크 샘플로 1회만 (0이면 모든 청크를 개별 스캔 후 합산) ──
     if schema_scan_sample_chunks <= 0:
@@ -372,6 +413,12 @@ def main():
                          help="토큰 수 근사 계산에 쓸 문자/토큰 비율")
     parser.add_argument("--chunk-overlap-ratio", type=float, default=DEFAULT_CHUNK_OVERLAP_RATIO)
     parser.add_argument(
+        "--quality-chunk-tokens", type=int, default=DEFAULT_QUALITY_CHUNK_TOKENS,
+        help="지정하면 컨텍스트 오버플로 여부와 무관하게 이 크기로 청크를 강제 분할한다 "
+             "(lost-in-the-middle/context rot 완화용). 미지정 시 기존처럼 오버플로 위험이 "
+             "있을 때만 청크한다."
+    )
+    parser.add_argument(
         "--schema-scan-sample-chunks", type=int, default=DEFAULT_SCHEMA_SCAN_SAMPLE_CHUNKS,
         help="A-1 스캔에 쓸 앞부분 청크 개수. 0 이하로 주면 모든 청크를 개별 스캔 후 "
              "합산한다 (문서 전체 대상 스캔, 호출 수는 늘어남)."
@@ -444,6 +491,7 @@ def main():
                 chars_per_token=args.chars_per_token,
                 chunk_overlap_ratio=args.chunk_overlap_ratio,
                 schema_scan_sample_chunks=args.schema_scan_sample_chunks,
+                quality_chunk_tokens=args.quality_chunk_tokens,
                 **llm_kwargs,
             )
         except Exception as e:
