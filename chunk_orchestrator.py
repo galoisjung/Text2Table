@@ -35,7 +35,7 @@ from pathlib import Path
 
 from preset_library import PRESETS
 from schema_extract import extract_table, parse_markdown_table, resolve_final_columns, validate_extraction
-from schema_scan import scan_schema
+from schema_scan import scan_schema, build_schema_scan_prompt, call_ollama_scan, apply_budget_policy
 
 # gpt-oss:120b-cloud 실측 context_length (Ollama 모델 메타데이터 기준)
 DEFAULT_MODEL_CONTEXT_TOKENS = 131072
@@ -183,6 +183,47 @@ def rows_to_markdown(header: list[str], rows: list[dict]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# 3.5. 전체 청크 스캔 (schema_scan_sample_chunks=0일 때)
+#      -- 청크들을 다시 이어붙이면 스캔 프롬프트 자체가 컨텍스트 예산을
+#      넘어버리므로, 청크마다 "개별적으로" 스캔한 뒤 후보를 느슨한
+#      정규화(normalize_key_value, 행 병합과 동일한 기준) 기준으로 합쳐
+#      recurrence를 합산하고, budget 정책은 합산된 결과에 마지막에
+#      한 번만 적용한다. A-2가 이미 쓰고 있는 "청크마다 반복" 원칙을
+#      A-1에도 그대로 적용한 것.
+# ─────────────────────────────────────────────────────────────
+def scan_schema_all_chunks(preset_id: str, chunks: list[str], llm_kwargs: dict) -> dict:
+    preset = PRESETS[preset_id]
+    if preset.extension_budget_default is None:
+        return {"skipped": True, "reason": "확장 열이 구조적으로 없는 preset"}
+
+    aggregated: dict[str, dict] = {}  # normalize_key_value(name) -> {name, recurrence, example_values}
+
+    for i, chunk in enumerate(chunks, 1):
+        print(f"    [D] 전체 스캔: 청크 {i}/{len(chunks)}...")
+        prompt = build_schema_scan_prompt(preset_id, chunk)
+        try:
+            raw = call_ollama_scan(prompt, **llm_kwargs)
+        except Exception as e:
+            print(f"    [경고] 청크 {i} 스캔 실패, 건너뜀: {e}")
+            continue
+
+        for c in raw.get("candidates", []):
+            name = str(c.get("name", "")).strip()
+            recurrence = c.get("recurrence", 0)
+            if not name or not isinstance(recurrence, (int, float)):
+                continue
+            key = normalize_key_value(name)
+            if key not in aggregated:
+                aggregated[key] = {"name": name, "recurrence": 0, "example_values": []}
+            aggregated[key]["recurrence"] += recurrence
+            aggregated[key]["example_values"].extend(c.get("example_values", []) or [])
+
+    candidates = list(aggregated.values())
+    result = apply_budget_policy(candidates, preset.extension_budget_default)
+    return {"skipped": False, "preset_id": preset_id, **result}
+
+
+# ─────────────────────────────────────────────────────────────
 # 4. 오케스트레이션
 # ─────────────────────────────────────────────────────────────
 def process_document(
@@ -231,13 +272,17 @@ def process_document(
     chunks = chunk_text(full_text, budget, chunk_overlap_ratio, chars_per_token)
     print(f"    [D] 문서를 {len(chunks)}개 청크로 분할 (예산: 청크당 약 {budget} 토큰)")
 
-    # ── 스키마는 대표 청크 샘플로 1회만 ──
-    sample_text = "\n\n".join(chunks[:schema_scan_sample_chunks])
-    scan_result = (
-        scan_schema(preset_id, sample_text, **llm_kwargs)
-        if preset.extension_budget_default is not None
-        else {"skipped": True, "reason": "확장 열이 구조적으로 없는 preset"}
-    )
+    # ── 스키마는 대표 청크 샘플로 1회만 (0이면 모든 청크를 개별 스캔 후 합산) ──
+    if schema_scan_sample_chunks <= 0:
+        scan_result = scan_schema_all_chunks(preset_id, chunks, llm_kwargs)
+    else:
+        n = min(schema_scan_sample_chunks, len(chunks))
+        sample_text = "\n\n".join(chunks[:n])
+        scan_result = (
+            scan_schema(preset_id, sample_text, **llm_kwargs)
+            if preset.extension_budget_default is not None
+            else {"skipped": True, "reason": "확장 열이 구조적으로 없는 preset"}
+        )
     accepted = scan_result.get("accepted_columns") if not scan_result.get("skipped") else None
     expected_columns = resolve_final_columns(preset, accepted)
 
@@ -326,7 +371,11 @@ def main():
     parser.add_argument("--chars-per-token", type=float, default=DEFAULT_CHARS_PER_TOKEN,
                          help="토큰 수 근사 계산에 쓸 문자/토큰 비율")
     parser.add_argument("--chunk-overlap-ratio", type=float, default=DEFAULT_CHUNK_OVERLAP_RATIO)
-    parser.add_argument("--schema-scan-sample-chunks", type=int, default=DEFAULT_SCHEMA_SCAN_SAMPLE_CHUNKS)
+    parser.add_argument(
+        "--schema-scan-sample-chunks", type=int, default=DEFAULT_SCHEMA_SCAN_SAMPLE_CHUNKS,
+        help="A-1 스캔에 쓸 앞부분 청크 개수. 0 이하로 주면 모든 청크를 개별 스캔 후 "
+             "합산한다 (문서 전체 대상 스캔, 호출 수는 늘어남)."
+    )
     parser.add_argument(
         "--resume",
         action="store_true",

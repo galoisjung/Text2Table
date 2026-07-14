@@ -4,25 +4,21 @@ text_to_table.py
 임의의 장문(.txt) 하나를 표로 변환하는 엔드투엔드 스크립트.
 
 C(preset_classifier) -> D(chunk_orchestrator, 내부에서 A-1/A-2 자동 호출)
--> E(roundtrip_verify) 순서로 지금까지 만든 함수들을 그대로 호출한다.
-새 로직은 거의 없고, 각 단계의 CLI가 하던 걸 파일 하나짜리 텍스트에 맞게
-직접 함수로 연결하는 오케스트레이션 스크립트다.
+까지만 실행한다. 표 -> 장문 round-trip 자기검증(E)은 여기서 다루지 않는다
+(필요하면 별도로 roundtrip_verify.py를 직접 돌리면 된다).
 
 지금까지의 다른 CLI들과 다른 점
 -------------------------------
-- 입력이 tables_longtext.json이 아니라 순수 .txt 파일이다. 즉:
-    * context_before/after: 표 주변 문맥이라는 개념 자체가 없으므로 빈 문자열
-    * 원본 table_markdown(정답): 없음 -> E에서 "정답과 비교"는 불가능,
-      환각/누락 체크(둘 다 정답 없이도 동작하도록 설계됨)만 유효
-- C가 preset_id=None(폴백)을 반환하면 A/D를 실행할 스키마 기준이 없다.
+- 입력이 tables_longtext.json이 아니라 순수 .txt 파일이다. 즉
+  context_before/after는 표 주변 문맥이라는 개념 자체가 없으므로 빈 문자열이다.
+- C가 preset_id=None(폴백)을 반환하면 D를 실행할 스키마 기준이 없다.
   자유 스키마(A 단독) 경로는 아직 구현돼 있지 않으므로, 여기서는 명확한
   오류 메시지와 함께 중단한다 (README의 "알려진 한계"에 기록된 항목).
 
 사용 예
 -------
     python text_to_table.py --input essay.txt
-    python text_to_table.py --input diary.txt --genre narrative
-    python text_to_table.py --input report.txt --skip-verification
+    python text_to_table.py --input report.txt --output report_table.md
 """
 
 from __future__ import annotations
@@ -34,7 +30,6 @@ from pathlib import Path
 
 from preset_classifier import classify_and_select_preset
 from chunk_orchestrator import process_document
-from roundtrip_verify import verify_extraction
 
 DEFAULT_MODEL = "gpt-oss:120b-cloud"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
@@ -64,12 +59,10 @@ def read_text_file(path: Path) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. 오케스트레이션 (C -> D -> E)
+# 1. 오케스트레이션 (C -> D)
 # ─────────────────────────────────────────────────────────────
 def convert_text_to_table(
     text: str,
-    genre: str = "informative",
-    skip_verification: bool = False,
     model: str = DEFAULT_MODEL,
     ollama_url: str = DEFAULT_OLLAMA_URL,
     timeout: int = DEFAULT_TIMEOUT,
@@ -79,8 +72,6 @@ def convert_text_to_table(
     chars_per_token: float | None = None,
     chunk_overlap_ratio: float | None = None,
     schema_scan_sample_chunks: int | None = None,
-    hallucination_threshold: float | None = None,
-    omission_threshold: float | None = None,
 ) -> dict:
     llm_kwargs = {"model": model, "ollama_url": ollama_url, "timeout": timeout, "max_retries": max_retries}
 
@@ -122,33 +113,12 @@ def convert_text_to_table(
         "classification": classification,
         "extraction": extraction,
         "table_markdown": table_markdown,
-        "verification": None,
     }
 
     if not table_markdown.strip():
         result["success"] = False
         result["stage_failed"] = "D"
         result["reason"] = "표가 비어있게 추출됨"
-        return result
-
-    # ── E: round-trip 자기검증 (선택적) ──
-    if skip_verification:
-        print("[E] --skip-verification 지정됨, 검증 생략")
-        return result
-
-    print("[E] round-trip으로 자기검증하는 중...")
-    verify_kwargs = {
-        k: v for k, v in {
-            "hallucination_threshold": hallucination_threshold,
-            "omission_threshold": omission_threshold,
-        }.items() if v is not None
-    }
-    verification = verify_extraction(
-        text, table_markdown, context_before="", context_after="",
-        genre=genre, **llm_kwargs, **verify_kwargs,
-    )
-    result["verification"] = verification
-    print(f"    -> {'통과' if verification['passed'] else '실패: ' + str(verification['fail_reason'])}")
 
     return result
 
@@ -156,28 +126,29 @@ def convert_text_to_table(
 # ─────────────────────────────────────────────────────────────
 # 2. 사람이 바로 읽는 Markdown 리포트
 # ─────────────────────────────────────────────────────────────
+def _quote_block(text: str) -> str:
+    """여러 줄 텍스트를 markdown blockquote로 안전하게 감싼다.
+    줄마다 '> '를 붙이지 않으면 빈 줄에서 인용구가 끊겨, 뒷부분이 마치
+    잘린 것처럼 보인다 (pdf_table_extractor.py에서 겪었던 것과 같은 문제)."""
+    return "\n".join(f"> {line}" for line in text.splitlines()) or "> (내용 없음)"
+
+
 def build_report_markdown(input_name: str, text: str, result: dict) -> str:
     lines = [f"# {input_name} → 표 변환 결과\n"]
 
     if not result["success"]:
         lines.append(f"**실패** (단계: {result.get('stage_failed')}) — {result.get('reason')}\n")
         lines.append("## 원문\n")
-        lines.append(f"> {text}\n")
+        lines.append(_quote_block(text) + "\n")
         return "\n".join(lines)
 
     extraction = result["extraction"]
-    verification = result.get("verification")
 
     lines.append(f"**preset**: {result['preset_id']}")
-    lines.append(f"**청크 처리**: {extraction.get('chunked')} (총 {extraction.get('num_chunks')}개 청크)")
-    if verification is None:
-        lines.append("**검증**: 생략됨 (`--skip-verification`)\n")
-    else:
-        status = "✅ 통과" if verification["passed"] else f"❌ 실패 — {verification['fail_reason']}"
-        lines.append(f"**검증**: {status}\n")
+    lines.append(f"**청크 처리**: {extraction.get('chunked')} (총 {extraction.get('num_chunks')}개 청크)\n")
 
     lines.append("## 원문\n")
-    lines.append(f"> {text}\n")
+    lines.append(_quote_block(text) + "\n")
 
     scan = extraction.get("scan", {})
     if not scan.get("skipped") and scan.get("accepted_columns"):
@@ -189,25 +160,6 @@ def build_report_markdown(input_name: str, text: str, result: dict) -> str:
 
     lines.append("## 추출된 표\n")
     lines.append(result["table_markdown"] or "(표 없음)")
-    lines.append("")
-
-    if verification:
-        lines.append("## 복원된 장문 (round-trip 결과)\n")
-        lines.append(f"> {verification.get('regenerated_long_text') or '(복원 실패)'}\n")
-
-        hall = verification.get("hallucination_check")
-        omit = verification.get("omission_check")
-        lines.append("## 검증 수치")
-        if hall:
-            lines.append(
-                f"- 환각 체크: coverage={hall['coverage_ratio']} "
-                f"({hall['covered_values']}/{hall['total_values']}), 의심값={hall['missing_values']}"
-            )
-        if omit:
-            lines.append(
-                f"- 누락 체크: coverage={omit['coverage_ratio']} "
-                f"({omit['covered_values']}/{omit['total_values']}), 사라진값={omit['missing_values']}"
-            )
 
     return "\n".join(lines)
 
@@ -219,8 +171,6 @@ def main():
     parser = argparse.ArgumentParser(description="임의의 장문(.txt)을 표로 변환합니다.")
     parser.add_argument("--input", required=True, help="입력 텍스트 파일(.txt)")
     parser.add_argument("--output", default=None, help="결과 .md 경로 (기본: 입력 파일명 기반)")
-    parser.add_argument("--genre", choices=["informative", "narrative"], default="informative")
-    parser.add_argument("--skip-verification", action="store_true", help="E(round-trip 자기검증) 생략")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
@@ -229,9 +179,11 @@ def main():
     parser.add_argument("--reserved-tokens", type=int, default=None)
     parser.add_argument("--chars-per-token", type=float, default=None)
     parser.add_argument("--chunk-overlap-ratio", type=float, default=None)
-    parser.add_argument("--schema-scan-sample-chunks", type=int, default=None)
-    parser.add_argument("--hallucination-threshold", type=float, default=None)
-    parser.add_argument("--omission-threshold", type=float, default=None)
+    parser.add_argument(
+        "--schema-scan-sample-chunks", type=int, default=None,
+        help="A-1 스캔에 쓸 앞부분 청크 개수. 0 이하로 주면 모든 청크를 개별 스캔 후 "
+             "합산한다 (문서 전체 대상 스캔, 호출 수는 늘어남). 기본값은 D의 기본값(2)."
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -244,8 +196,6 @@ def main():
 
     result = convert_text_to_table(
         text,
-        genre=args.genre,
-        skip_verification=args.skip_verification,
         model=args.model,
         ollama_url=args.ollama_url,
         timeout=args.timeout,
@@ -255,8 +205,6 @@ def main():
         chars_per_token=args.chars_per_token,
         chunk_overlap_ratio=args.chunk_overlap_ratio,
         schema_scan_sample_chunks=args.schema_scan_sample_chunks,
-        hallucination_threshold=args.hallucination_threshold,
-        omission_threshold=args.omission_threshold,
     )
 
     output_md = Path(args.output) if args.output else input_path.with_suffix(".table.md")
