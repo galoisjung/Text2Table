@@ -38,6 +38,10 @@ DEFAULT_MODEL = "gpt-oss:120b-cloud"
 DEFAULT_TIMEOUT = 120
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_CONFIDENCE_THRESHOLD = 0.6
+DEFAULT_CLASSIFICATION_SAMPLE_CHARS = 16000  # 대략 8천 토큰 남짓. 축 분류는 구조/장르
+                                              # 판단만 하면 되므로 전체 문서를 다 넣을
+                                              # 필요가 없다 -- 텍스트가 길면 400(payload
+                                              # 초과) 오류가 나므로 앞부분 샘플만 사용.
 
 _VALID_FOCUS = {"single_subject", "multi_entity"}
 _VALID_TIME = {"timeseries", "non_timeseries"}
@@ -47,11 +51,15 @@ _VALID_ATTR = {"single_attribute", "multi_attribute", "not_applicable"}
 # ─────────────────────────────────────────────────────────────
 # 1. 분류 프롬프트
 # ─────────────────────────────────────────────────────────────
-def build_classification_prompt(text: str) -> str:
+def build_classification_prompt(text: str, avoid_note: str = "") -> str:
+    avoid_block = f"\n{avoid_note}\n" if avoid_note else ""
     return f"""당신은 임의의 한국어 텍스트를 표로 정리하기 위한 사전 분석가입니다.
 아래 텍스트를 읽고, 이 텍스트를 표로 만든다면 표의 "모양"이 어떻게 되어야
 하는지 판단하는 세 가지 질문에 답하세요. 텍스트에 실제 표가 있었는지는
-중요하지 않습니다 — 순수한 서술문이라도 판단하세요.
+중요하지 않습니다 — 순수한 서술문이라도 판단하세요. 아래 텍스트는 원문
+전체가 아니라 앞부분 발췌일 수 있습니다 — 그래도 구조적 패턴(개체 나열
+여부, 시간 흐름 여부)은 충분히 판단 가능하니 발췌라는 이유로 판단을
+주저하지 마세요.
 
 [질문 1] focus: 이 텍스트가 여러 개체(사람/회사/항목 등)를 나열하는가,
 아니면 하나의 주제나 개체에 대해서만 이야기하는가?
@@ -92,7 +100,14 @@ def build_classification_prompt(text: str) -> str:
   200주를 거래했다."
   -> focus: multi_entity (A사 거래, B사 거래라는 서로 다른 사건이 나열됨),
   time_structure: timeseries (날짜마다 다른 사건이 반복되며 나열됨)
-
+- "해리는 생일 아침 눈을 떴다. 잠시 후 도비가 나타나 경고를 전했고, 저녁이
+  되자 위즐리 가족이 그를 데리러 왔다."
+  -> focus: single_subject (해리라는 한 이야기의 흐름), time_structure:
+  timeseries (사건이 "잠시 후", "저녁이 되자"처럼 시간 순서로 전개됨 --
+  날짜가 명시적 숫자로 안 나와도 사건이 순서대로 이어지면 timeseries다).
+  이런 경우는 책 제목·저자 같은 "책 메타데이터"(vertical_entity)와 구분해야
+  한다 -- 실제 이야기 전개 자체를 표로 만들 때는 event_timeline이 맞다.
+{avoid_block}
 아래 JSON 형식으로만 답하세요. 다른 설명이나 markdown 코드펜스는 쓰지 마세요.
 {{"focus": "...", "time_structure": "...", "attribute_count": "...", "confidence": 0.0에서 1.0 사이 숫자, "reasoning": "판단 근거 한 문장"}}
 
@@ -193,11 +208,20 @@ def classify_and_select_preset(
     timeout: int = DEFAULT_TIMEOUT,
     max_retries: int = DEFAULT_MAX_RETRIES,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    sample_chars: int = DEFAULT_CLASSIFICATION_SAMPLE_CHARS,
+    avoid_note: str = "",
 ) -> dict:
     """
     텍스트 -> (축 분류 -> preset 결정) 전체 파이프라인.
     반환값에는 항상 axes(원본 분류 결과)와 preset_id(또는 None)가 담긴다.
     preset_id가 None이면 fallback_reason에 사유가 남는다.
+
+    텍스트가 sample_chars보다 길면 앞부분만 잘라서 분류 프롬프트에 쓴다.
+    구조/장르 판단은 문서 전체를 다 볼 필요가 없고, 다 넣으면 -cloud 모델
+    게이트웨이가 요청 자체를 400으로 거부하는 경우가 있어 이를 방지한다.
+
+    avoid_note가 있으면(여러 표를 반복 추출하는 상황) 프롬프트에 그대로
+    삽입되어, 이미 사용한 관점과 다른 구조를 찾도록 유도한다.
     """
     if not text or not text.strip():
         return {
@@ -206,7 +230,8 @@ def classify_and_select_preset(
             "fallback_reason": "빈 텍스트",
         }
 
-    prompt = build_classification_prompt(text)
+    sample_text = text if len(text) <= sample_chars else text[:sample_chars]
+    prompt = build_classification_prompt(sample_text, avoid_note=avoid_note)
     axes = call_ollama_classify(
         prompt, model=model, ollama_url=ollama_url, timeout=timeout, max_retries=max_retries
     )
@@ -273,6 +298,11 @@ def main():
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument("--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD)
+    parser.add_argument(
+        "--classification-sample-chars", type=int, default=DEFAULT_CLASSIFICATION_SAMPLE_CHARS,
+        help="분류 프롬프트에 쓸 앞부분 문자 수 상한. 이보다 길면 잘라서 사용 "
+             "(전체를 다 넣으면 -cloud 모델에서 400 오류가 날 수 있음)."
+    )
     args = parser.parse_args()
 
     items = _load_texts(Path(args.input), args.field)
@@ -292,6 +322,7 @@ def main():
                 timeout=args.timeout,
                 max_retries=args.max_retries,
                 confidence_threshold=args.confidence_threshold,
+                sample_chars=args.classification_sample_chars,
             )
         except Exception as e:
             result = {"axes": None, "preset_id": None, "fallback_reason": f"오류: {e}"}

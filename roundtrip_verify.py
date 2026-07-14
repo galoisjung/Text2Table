@@ -60,7 +60,7 @@ DEFAULT_OMISSION_THRESHOLD = 0.7       # 원문 사실이 라운드트립 후 �
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. 원문에서 "사실성이 강한" 토큰 추출 (숫자/날짜/퍼센트)
+# 1. 원문에서 "사실성이 강한" 토큰 추출 (숫자/날짜/퍼센트 + 고유명사)
 #    -- 표가 없어도 원문만으로 뽑을 수 있어야 일반화된 검증이 됨
 # ─────────────────────────────────────────────────────────────
 _SALIENT_PATTERNS = [
@@ -70,11 +70,70 @@ _SALIENT_PATTERNS = [
     r"(?<![\d.%])\d{4,}(?![\d.%])",  # 그 외 4자리 이상 숫자 (일련번호성 노이즈 방지)
 ]
 
+# 한국어 NER 모델 (KLUE-NER로 파인튜닝된 KoELECTRA). 숫자/날짜 정규식만으로는
+# 인물/지명/기관 같은 고유명사를 전혀 못 잡는다 -- 서사 텍스트(소설 등)는
+# 애초에 숫자·날짜가 적어서 salient_tokens가 거의 비다시피 하는 문제가 있었다.
+_NER_MODEL_NAME = "Leo97/KoELECTRA-small-v3-modu-ner"
+_NER_RELEVANT_LABELS = {"PS", "PER", "PERSON", "LC", "LOC", "LOCATION", "OG", "ORG", "ORGANIZATION"}
+_ner_pipeline = None  # 지연 로딩 싱글턴. 로딩 실패 시 False로 고정해 재시도하지 않음
 
-def extract_salient_tokens(text: str) -> list[str]:
+
+def _get_ner_pipeline():
+    global _ner_pipeline
+    if _ner_pipeline is not None:
+        return _ner_pipeline
+    try:
+        from transformers import pipeline
+        _ner_pipeline = pipeline("ner", model=_NER_MODEL_NAME, aggregation_strategy="simple")
+    except Exception as e:
+        print(f"    [경고] NER 모델을 불러오지 못해 고유명사 추출을 건너뜁니다 "
+              f"(정규식 기반 숫자/날짜만 사용): {e}")
+        _ner_pipeline = False
+    return _ner_pipeline
+
+
+def extract_named_entities(text: str, max_chars: int = 5000) -> list[str]:
+    """
+    인물/지명/기관 개체명을 추출한다. 모델을 못 불러오면(미설치/오프라인 등)
+    빈 리스트를 반환하고 정규식 기반 salient_tokens만으로 조용히 폴백한다.
+
+    text가 길면 앞부분 max_chars만 사용한다 -- NER 모델 자체의 입력 길이
+    한도가 훨씬 작기도 하고(보통 512토큰 안팎), salient_tokens는 "이 문서에
+    어떤 고유명사가 등장했는지"를 판단하는 체크리스트 역할이라 문서 전체를
+    다 훑지 않아도 대표적인 인물/지명은 앞부분에서 웬만큼 잡힌다.
+    """
+    ner = _get_ner_pipeline()
+    if not ner:
+        return []
+
+    try:
+        results = ner(text[:max_chars])
+    except Exception as e:
+        print(f"    [경고] NER 추론 실패, 건너뜁니다: {e}")
+        return []
+
+    entities: list[str] = []
+    seen = set()
+    for r in results:
+        label = str(r.get("entity_group") or r.get("entity") or "").upper()
+        label = re.sub(r"^[BI]-", "", label)  # BIO 태깅 접두사 제거
+        if not any(lbl in label for lbl in _NER_RELEVANT_LABELS):
+            continue
+        word = str(r.get("word", "")).replace("##", "").strip()
+        if len(word) < 2:  # 한 글자짜리는 토큰화 잔재일 확률이 높아 노이즈로 간주
+            continue
+        if word not in seen:
+            seen.add(word)
+            entities.append(word)
+    return entities
+
+
+def extract_salient_tokens(text: str, include_entities: bool = True) -> list[str]:
     tokens: list[str] = []
     for pattern in _SALIENT_PATTERNS:
         tokens.extend(re.findall(pattern, text))
+    if include_entities:
+        tokens.extend(extract_named_entities(text))
     # 중복 제거하되 순서는 유지 (등장 빈도보다 "이런 사실이 있었다"가 중요)
     seen = set()
     unique_tokens = []
@@ -140,6 +199,7 @@ def verify_extraction(
     max_retries: int = DEFAULT_MAX_RETRIES,
     hallucination_threshold: float = DEFAULT_HALLUCINATION_THRESHOLD,
     omission_threshold: float = DEFAULT_OMISSION_THRESHOLD,
+    include_entities: bool = True,
 ) -> dict:
     if not candidate_table_markdown.strip():
         return {
@@ -163,7 +223,7 @@ def verify_extraction(
         verbalization_prompt, model=model, ollama_url=ollama_url,
         timeout=timeout, max_retries=max_retries,
     )
-    salient_tokens = extract_salient_tokens(original_long_text)
+    salient_tokens = extract_salient_tokens(original_long_text, include_entities=include_entities)
     omission_check = check_value_coverage(regenerated_long_text, salient_tokens)
 
     passed = (
@@ -313,6 +373,11 @@ def main():
     parser.add_argument("--hallucination-threshold", type=float, default=DEFAULT_HALLUCINATION_THRESHOLD)
     parser.add_argument("--omission-threshold", type=float, default=DEFAULT_OMISSION_THRESHOLD)
     parser.add_argument(
+        "--no-ner", action="store_true",
+        help="누락 체크에 NER(고유명사) 기반 salient token을 포함하지 않고 "
+             "정규식(숫자/날짜) 기반만 사용한다."
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="--output과 같은 폴더의 중간 저장 파일(.jsonl)을 읽어 이미 처리된 item_id는 건너뛰고 이어서 처리",
@@ -403,6 +468,7 @@ def main():
                     max_retries=args.max_retries,
                     hallucination_threshold=args.hallucination_threshold,
                     omission_threshold=args.omission_threshold,
+                    include_entities=not args.no_ner,
                 )
             except Exception as e:
                 print(f"    [오류] {item_id} 검증 실패: {e}")
