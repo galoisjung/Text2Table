@@ -43,6 +43,11 @@
 python text_to_table.py --input essay.txt
 ```
 
+(C→D만 실행한다. round-trip 검증까지 보고 싶으면 `roundtrip_verify.py`를 별도로
+돌린다 — 입력 형식이 달라서 `text_to_table.py`의 출력을 바로 넣을 수는 없고,
+`tables_longtext.json` 형식의 배치 입력이 필요하다. 아래 "PDF부터 시작하는 전체
+경로" 참고.)
+
 PDF부터 시작하는 전체 경로:
 
 ```bash
@@ -69,7 +74,7 @@ python roundtrip_verify.py --longtext longtext_out/tables_longtext.json --extrac
 | **A-2** | `schema_extract.py` | 최종 표 추출 *(D가 내부 호출)* | 스키마 + long_text | `table_markdown` |
 | **D** | `chunk_orchestrator.py` | A-1/A-2 실행 진입점, 긴 문서 청크 분할·병합 | `preset_classification.json` | `chunk_extract_result.json` |
 | **E** | `roundtrip_verify.py` | round-trip 자기검증 (환각/누락) | `chunk_extract_result.json` | `roundtrip_verify_result.json/md` |
-| **통합** | `text_to_table.py` | 텍스트 파일 하나에 C→D→E를 전부 실행 | `.txt` 파일 | `{name}.table.md/json` |
+| **통합** | `text_to_table.py` | 텍스트 파일 하나에 C→D만 실행 (E는 관심사 분리로 별도 실행) | `.txt` 파일 | `{name}.table.md/json` |
 
 > `schema_scan.py`/`schema_extract.py`의 CLI는 실제 실행 경로에서 안 쓴다.
 > `chunk_orchestrator.py`가 두 파일의 함수를 직접 import해서 쓰기 때문 —
@@ -83,8 +88,12 @@ PDF ─▶ 표(Markdown) ─▶ long_text ┐
                                   ▼
                     D: 스키마 제안(A-1) → 추출(A-2) → [청크 병합]
                                   ▼
-                    E: round-trip 자기검증
+                    E: round-trip 자기검증 (선택 · 별도 실행)
 ```
+
+> `text_to_table.py`는 C→D까지만 자동 실행한다. 검증(E)이 필요하면
+> `roundtrip_verify.py`를 별도로 돌린다 — 표 변환과 검증을 분리해서, 검증이
+> 필요 없는 경우 LLM 호출을 아낄 수 있게 했다.
 
 ---
 
@@ -161,6 +170,13 @@ PDF ─▶ 표(Markdown) ─▶ long_text ┐
   - 안 넘으면: 청크 없이 `scan_schema()` + `extract_table()` 그대로
   - 넘으면: 문단/문장 경계로 분할(overlap 포함) → **스키마는 대표 청크로 1회만** → 청크마다 동일 스키마로 추출 → 느슨한 정규화(공백/기호 제거, 임베딩 없음)로 병합 → 병합 표 재검증
 - `--resume` + `.jsonl` 체크포인트: 항목 처리 즉시 저장, 중단돼도 이어서 처리
+- `--schema-scan-sample-chunks 0`: 앞부분 청크 샘플만 보는 대신, 모든 청크를 개별
+  스캔한 뒤 느슨한 정규화로 후보를 합쳐 recurrence를 합산 (문서 전체 대상 스캔,
+  청크마다 컨텍스트 예산 안에서 호출되므로 안전)
+- `--quality-chunk-tokens`: 컨텍스트 오버플로 여부와 무관하게 청크 크기를 강제
+  지정 가능. "컨텍스트에 다 들어간다"와 "그 안에서 다 정확히 처리한다"는 다른
+  문제라는 점(lost-in-the-middle, context rot)에 따라, 오버플로 방지 상한과
+  품질 목표 청크 크기를 분리했다
 
 </details>
 
@@ -176,12 +192,15 @@ PDF ─▶ 표(Markdown) ─▶ long_text ┐
 </details>
 
 <details>
-<summary><b>text_to_table.py</b> — 통합: .txt 하나 → 표</summary>
+<summary><b>text_to_table.py</b> — 통합: .txt 하나 → 표 (C→D)</summary>
 
-- `preset_classifier`/`chunk_orchestrator`/`roundtrip_verify`의 함수를 직접 import해서 C→D→E를 한 번에 실행
-- 출처 표가 없는 순수 텍스트가 입력이므로 `context_before/after`는 빈 문자열, E의 "정답과 비교"는 불가(환각/누락 체크만 유효)
+- `preset_classifier`/`chunk_orchestrator`의 함수를 직접 import해서 C→D만 실행
+  (E는 관심사 분리를 위해 빠짐 — 검증이 필요하면 `roundtrip_verify.py`를 별도로 돌린다)
+- 출처 표가 없는 순수 텍스트가 입력이므로 `context_before/after`는 빈 문자열
 - C가 폴백(`preset_id=None`)을 반환하면 자유 스키마 경로가 아직 없어 명확한 사유와 함께 종료
 - 인코딩 자동 판별(UTF-8→UTF-8-BOM→CP949), HTTP 5xx 자동 재시도
+- `.md` 리포트의 원문은 줄마다 blockquote 처리해, 여러 문단짜리 텍스트도 중간에
+  끊긴 것처럼 안 보이고 전체가 다 보이게 함
 
 </details>
 
@@ -309,7 +328,26 @@ E를 설계할 때, 1번 항목(왜 round-trip을 시작했는지)으로 다시 
 실제 사례가 눈에 보였다 — "라운드트립은 헤더 문자열이 아니라 구조와 값으로
 평가해야 한다"는 원칙을 실측 데이터로 재확인한 순간이다.
 
+### 8. 실행부 분리, 그리고 "컨텍스트에 들어간다"와 "품질"은 다른 문제
+`text_to_table.py`는 처음엔 C→D→E를 한 번에 실행했다. 그런데 표만 뽑으면 되고
+검증까지는 필요 없는 경우엔 E의 LLM 호출이 그냥 낭비였다 — 그래서 E를 분리해
+`text_to_table.py`는 C→D만 하고, 검증이 필요하면 `roundtrip_verify.py`를 별도로
+돌리는 구조로 바꿨다. 표 변환과 검증을 서로 다른 관심사로 나눈 것.
 
+또 하나, "gpt-oss:120b-cloud가 컨텍스트가 아무리 커도 나눠 넣는 게 낫지 않냐"는
+지적이 있었다. 실제로 찾아보니 이건 근거가 있는 우려였다 — **lost-in-the-middle**
+(정보가 컨텍스트 중간에 있으면 정확도가 U자형으로 떨어지는 현상)과 **context rot**
+(위치와 무관하게 입력이 길어지기만 해도 정확도가 떨어지는 현상)은 서로 다른, 둘 다
+입증된 열화 현상이고, 특히 "빠짐없이 다 세고 다 뽑아야 하는" 우리의 A-1
+recurrence 집계나 A-2 전체 추출 같은 작업이 여기 가장 취약한 유형이다. "컨텍스트
+한도 안에 들어간다"와 "그 안에서 다 정확히 처리한다"는 별개 문제라는 뜻이다.
+
+그래서 "오버플로를 막기 위한 상한"(`model_context_tokens`/`reserved_tokens`)과
+"품질을 위한 목표 청크 크기"(`quality_chunk_tokens`, 신규)를 분리했다. 후자를
+지정하면 컨텍스트에 여유가 있어도 그보다 작게 강제로 나눠서 처리한다. 다만 아주
+짧은 텍스트까지 무조건 나누게 만들지는 않았다 — 필요 없는 병합 오버헤드만 늘 뿐,
+새로운 이점이 없기 때문이다. 이 값을 지정 안 하면 예전과 동일하게 동작하도록
+기본값은 `None`으로 뒀다.
 
 ### 핵심 통찰 요약
 
@@ -328,3 +366,5 @@ E를 설계할 때, 1번 항목(왜 round-trip을 시작했는지)으로 다시 
   "이 칸엔 자연스러운 행 단위가 없다"던 초기 판단이 실제 데이터로 반박되면서
   추가됐다.
 - **장시간 파이프라인은 중간 저장이 기본값이어야 한다.**
+- **"컨텍스트에 들어간다"와 "그 안에서 다 정확히 처리한다"는 다른 문제다.**
+  한도를 꽉 채우기보다, 처리 품질을 기준으로 별도의 청크 크기를 정하는 게 낫다.
