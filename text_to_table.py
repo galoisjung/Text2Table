@@ -29,7 +29,9 @@ import sys
 from pathlib import Path
 
 from preset_classifier import classify_and_select_preset
-from chunk_orchestrator import process_document
+from chunk_orchestrator import process_document, needs_chunking, maybe_split_by_subject
+from schema_extract import parse_markdown_table
+import preset_selection
 
 DEFAULT_MODEL = "gpt-oss:120b-cloud"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
@@ -73,8 +75,116 @@ def convert_text_to_table(
     chunk_overlap_ratio: float | None = None,
     schema_scan_sample_chunks: int | None = None,
     quality_chunk_tokens: int | None = None,
+    check_subject_split: bool = True,
+    verified_preset_selection: bool = False,
+    genre: str = "informative",
+    min_accept_score: float | None = None,
+    selection_sample_chars: int | None = None,
 ) -> dict:
     llm_kwargs = {"model": model, "ollama_url": ollama_url, "timeout": timeout, "max_retries": max_retries}
+    selection_kwargs = {} if min_accept_score is None else {"min_accept_score": min_accept_score}
+
+    chunk_kwargs = {
+        k: v for k, v in {
+            "model_context_tokens": model_context_tokens,
+            "reserved_tokens": reserved_tokens,
+            "chars_per_token": chars_per_token,
+            "chunk_overlap_ratio": chunk_overlap_ratio,
+            "schema_scan_sample_chunks": schema_scan_sample_chunks,
+            "quality_chunk_tokens": quality_chunk_tokens,
+        }.items() if v is not None
+    }
+
+    # ── C+ (선택적): 후보 preset 스크리닝 + round-trip 검증 기반 선택 ──
+    if verified_preset_selection:
+        chunk_kwargs_for_check = {
+            k: v for k, v in chunk_kwargs.items()
+            if k in ("model_context_tokens", "reserved_tokens", "chars_per_token")
+        }
+        chunked_needed = needs_chunking(text, **chunk_kwargs_for_check)
+
+        if chunked_needed:
+            # ── 표본으로 preset만 결정 (A안): 청크마다/후보마다 전체를 다시
+            # 추출하는 건 비용이 너무 커서, C(preset_classifier)가 이미 안고
+            # 있는 "표본 기반 판단" 리스크 수준을 C+도 그대로 유지한다.
+            # preset이 결정되면 실제 청크 추출은 그대로 D가 전담한다.
+            sample_chars = selection_sample_chars or preset_selection.DEFAULT_SELECTION_SAMPLE_CHARS
+            sample_text = text if len(text) <= sample_chars else text[:sample_chars]
+            print(f"[C+] 텍스트가 길어 표본({len(sample_text)}자)으로 preset을 먼저 결정합니다...")
+            selection = preset_selection.select_preset_with_verification(
+                sample_text, genre=genre, **llm_kwargs, **selection_kwargs,
+            )
+            if not selection.get("success"):
+                return {
+                    "success": False,
+                    "stage_failed": "C+",
+                    "selection": selection,
+                    "reason": selection.get("reason", "C+ 선택 실패 (표본 기반)"),
+                }
+
+            preset_id = selection["selected_preset_id"]
+            print(f"    -> 표본 기반 채택: {preset_id} (점수={selection.get('selection_score')}, "
+                  f"임계치 통과={selection.get('selection_passed_threshold')}) -- 전체 문서는 D가 청크 추출합니다")
+
+            print("[D] 표를 추출하는 중...")
+            extraction = process_document(
+                preset_id, text, context_before="", context_after="",
+                check_subject_split=check_subject_split, **llm_kwargs, **chunk_kwargs,
+            )
+            table_markdown = extraction.get("table_markdown", "")
+            row_count = extraction.get("validation", {}).get("row_count", 0)
+            print(f"    -> chunked={extraction.get('chunked')}, num_chunks={extraction.get('num_chunks')}, {row_count}행 추출")
+
+            result = {
+                "success": True,
+                "preset_id": preset_id,
+                "selection": selection,
+                "selection_used_sample": True,
+                "extraction": extraction,
+                "table_markdown": table_markdown,
+            }
+            if not table_markdown.strip():
+                result["success"] = False
+                result["stage_failed"] = "D"
+                result["reason"] = "표가 비어있게 추출됨"
+            return result
+
+        # ── 청크가 필요 없는 경우: 문서 전체로 C+ 전체 절차(스크리닝+표생성+E검증)를 그대로 수행 ──
+        print("[C+] 후보 preset 스크리닝 + round-trip 검증 중...")
+        selection = preset_selection.select_preset_with_verification(
+            text, genre=genre, **llm_kwargs, **selection_kwargs,
+        )
+        if not selection.get("success"):
+            return {
+                "success": False,
+                "stage_failed": "C+",
+                "selection": selection,
+                "reason": selection.get("reason", "C+ 선택 실패"),
+            }
+
+        preset_id = selection["selected_preset_id"]
+        table_markdown = selection.get("table_markdown", "")
+        print(f"    -> 채택된 preset: {preset_id} (점수={selection.get('selection_score')}, "
+              f"임계치 통과={selection.get('selection_passed_threshold')})")
+
+        subject_split = None
+        if check_subject_split and table_markdown.strip():
+            header, rows = parse_markdown_table(table_markdown)
+            subject_split = maybe_split_by_subject(preset_id, header, rows, llm_kwargs)
+
+        result = {
+            "success": bool(table_markdown.strip()),
+            "preset_id": preset_id,
+            "selection": selection,
+            "selection_used_sample": False,
+            "extraction": {**selection["extraction"], "subject_split": subject_split},
+            "table_markdown": table_markdown,
+        }
+        if not table_markdown.strip():
+            result["success"] = False
+            result["stage_failed"] = "C+"
+            result["reason"] = "표가 비어있게 추출됨"
+        return result
 
     # ── C: 축 분류 + preset 선택 ──
     print("[C] 텍스트를 분류하는 중...")
@@ -92,18 +202,9 @@ def convert_text_to_table(
 
     # ── D: 스키마 제안(A-1) + 추출(A-2), 필요하면 청크 처리까지 ──
     print("[D] 표를 추출하는 중...")
-    chunk_kwargs = {
-        k: v for k, v in {
-            "model_context_tokens": model_context_tokens,
-            "reserved_tokens": reserved_tokens,
-            "chars_per_token": chars_per_token,
-            "chunk_overlap_ratio": chunk_overlap_ratio,
-            "schema_scan_sample_chunks": schema_scan_sample_chunks,
-            "quality_chunk_tokens": quality_chunk_tokens,
-        }.items() if v is not None
-    }
     extraction = process_document(
-        preset_id, text, context_before="", context_after="", **llm_kwargs, **chunk_kwargs,
+        preset_id, text, context_before="", context_after="",
+        check_subject_split=check_subject_split, **llm_kwargs, **chunk_kwargs,
     )
     table_markdown = extraction.get("table_markdown", "")
     row_count = extraction.get("validation", {}).get("row_count", 0)
@@ -147,7 +248,30 @@ def build_report_markdown(input_name: str, text: str, result: dict) -> str:
     extraction = result["extraction"]
 
     lines.append(f"**preset**: {result['preset_id']}")
-    lines.append(f"**청크 처리**: {extraction.get('chunked')} (총 {extraction.get('num_chunks')}개 청크)\n")
+
+    selection = result.get("selection")
+    if selection is not None:
+        used_sample = result.get("selection_used_sample", False)
+        mode_label = "C+ (표본 기반 preset 선택 -> D가 전체 문서 청크 추출)" if used_sample else "C+ (후보 스크리닝 + round-trip 검증, 청크 불필요)"
+        lines.append(f"**선택 방식**: {mode_label}")
+        if selection.get("fallback_used"):
+            lines.append(f"**폴백 사용됨**: {selection.get('fallback_reason')} -> 기존 C(단일 분류)로 대체")
+        else:
+            lines.append(
+                f"**선택 점수**: {selection.get('selection_score')} "
+                f"(임계치 통과: {selection.get('selection_passed_threshold')})"
+            )
+            tried = selection.get("candidates_tried", [])
+            evaluated = selection.get("candidates_evaluated", [])
+            if len(tried) > 1:
+                score_str = ", ".join(f"{e['preset_id']}={e['score']}" for e in evaluated)
+                note = " (표본 기준 점수 -- 실제 표는 D가 전체 문서로 재추출함)" if used_sample else ""
+                lines.append(f"**시도된 후보**: {tried} (점수: {score_str or '평가 실패'}){note}")
+        if used_sample:
+            lines.append(f"**청크 처리**: {extraction.get('chunked')} (총 {extraction.get('num_chunks')}개 청크)")
+        lines.append("")
+    else:
+        lines.append(f"**청크 처리**: {extraction.get('chunked')} (총 {extraction.get('num_chunks')}개 청크)\n")
 
     lines.append("## 원문\n")
     lines.append(_quote_block(text) + "\n")
@@ -160,8 +284,21 @@ def build_report_markdown(input_name: str, text: str, result: dict) -> str:
     if extraction.get("merge_conflicts"):
         lines.append(f"## 청크 병합 충돌 (D)\n{extraction['merge_conflicts']}\n")
 
+    subject_split = extraction.get("subject_split")
+    if subject_split and subject_split.get("mixed"):
+        labels = [t["label"] for t in subject_split["tables"]]
+        lines.append(
+            f"## ⚠️ 주제 섞임 감지 -- {len(labels)}개 표로 분리됨: {labels}\n"
+            f"(아래 '추출된 표'는 분리 전 병합본입니다. 분리된 표는 이 아래에 각각 표시됩니다.)\n"
+        )
+
     lines.append("## 추출된 표\n")
     lines.append(result["table_markdown"] or "(표 없음)")
+
+    if subject_split and subject_split.get("mixed"):
+        for t in subject_split["tables"]:
+            lines.append(f"\n### 분리된 표 — {t['label']} ({t['row_count']}행)\n")
+            lines.append(t["table_markdown"])
 
     return "\n".join(lines)
 
@@ -192,6 +329,28 @@ def main():
              "(lost-in-the-middle/context rot 완화용). 미지정 시 기존처럼 오버플로 위험이 "
              "있을 때만 청크한다."
     )
+    parser.add_argument(
+        "--no-subject-split", action="store_true",
+        help="최종 표(vertical_entity/listing)에 대해 주제 섞임 감지+분리를 돌리지 않는다. "
+             "기본은 켜져 있음."
+    )
+    parser.add_argument(
+        "--verified-preset-selection", action="store_true",
+        help="C(단일 분류) 대신 C+(후보 preset 스크리닝 + round-trip 검증 기반 선택)를 사용한다. "
+             "텍스트가 청크가 필요할 만큼 길면 자동으로 기존 C→D로 폴백한다."
+    )
+    parser.add_argument("--genre", choices=["informative", "narrative"], default="informative",
+                         help="C+ 사용 시 round-trip 재-verbalize에 쓰이는 문체.")
+    parser.add_argument(
+        "--min-accept-score", type=float, default=None,
+        help="C+ 사용 시, 후보를 '채택 가능'으로 보는 최소 round-trip 점수 (기본 0.75)."
+    )
+    parser.add_argument(
+        "--selection-sample-chars", type=int, default=None,
+        help="C+ 사용 + 텍스트가 청크가 필요할 만큼 길 때, preset 결정에 쓸 앞부분 표본 "
+             "문자 수 상한 (기본 16000). 표본으로 preset만 정하고, 실제 청크 추출은 D가 "
+             "전체 문서로 수행한다."
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -214,6 +373,11 @@ def main():
         chunk_overlap_ratio=args.chunk_overlap_ratio,
         schema_scan_sample_chunks=args.schema_scan_sample_chunks,
         quality_chunk_tokens=args.quality_chunk_tokens,
+        check_subject_split=not args.no_subject_split,
+        verified_preset_selection=args.verified_preset_selection,
+        genre=args.genre,
+        min_accept_score=args.min_accept_score,
+        selection_sample_chars=args.selection_sample_chars,
     )
 
     output_md = Path(args.output) if args.output else input_path.with_suffix(".table.md")

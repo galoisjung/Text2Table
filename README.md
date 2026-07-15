@@ -110,15 +110,17 @@ PDF(텍스트 레이어) ─▶ pdf_to_table.py ─▶ text ┤
                                     │                        ▼
                                     │           E: round-trip 자기검증 (선택 · 별도 실행)
                                     ▼
-                     F: 표 여러 개 반복 추출 (내부에서 C→D→E 반복, coverage로 정지)
+                     F: 문서 전체 사전 스캔(메뉴 구성) → 메뉴대로 D 반복 추출 → E로 정지 판단
 ```
 
 > `text_to_table.py`는 C→D까지만 자동 실행한다. 검증(E)이 필요하면
 > `roundtrip_verify.py`를 별도로 돌린다 — 표 변환과 검증을 분리해서, 검증이
 > 필요 없는 경우 LLM 호출을 아낄 수 있게 했다.
-> `multi_table_extractor.py`(F)는 회차마다 C→D를 새로 돌리고, E의 누락 체크
-> 로직(재-verbalize 후 coverage 측정)을 표를 더 뽑을지 멈출지 정하는 정지
-> 신호로 재사용한다. `pdf_to_table.py`는 텍스트 레이어가 있는 PDF를 pypdf로
+> `multi_table_extractor.py`(F)는 2단계로 동작한다. 1단계에서 문서 전체를
+> 구간별로 나눠 **먼저 한 번씩 다 분류**해 `(preset_id, subject)` 조합의
+> "메뉴"를 만들고, 2단계에서 메뉴를 순서대로 소비하며 각 subject에 해당하는
+> 구간만 발췌해 D(추출)를 돌린다. 표를 하나 뽑을 때마다 E의 누락 체크 로직
+> (재-verbalize 후 coverage 측정)으로 더 뽑을지 멈출지를 판단한다. `pdf_to_table.py`는 텍스트 레이어가 있는 PDF를 pypdf로
 > 가볍게 텍스트만 뽑아 `text_to_table.py`(표 1개) 또는
 > `multi_table_extractor.py`(표 여러 개, `--multi`)로 넘기는 얇은 통합
 > 스크립트다 — docling 기반 표 추출(`pdf_table_extractor.py`)과는 별개
@@ -176,6 +178,9 @@ PDF(텍스트 레이어) ─▶ pdf_to_table.py ─▶ text ┤
 - `preset_library.py`: preset 5개 정의 + `select_preset(focus, time_structure, attribute_count)` 결정 트리 (LLM 의존성 없는 순수 로직)
 - `preset_classifier.py`: LLM으로 3개 축을 분류 → `select_preset()`으로 preset 확정
 - 신뢰도가 낮으면 `preset_id=None` + `fallback_reason` 반환 (자유 스키마 경로 신호, 현재 미구현)
+- 축과 별개로 `subjects`(이 텍스트가 다루는 핵심 대상/사건, 최대 3개) 배열도 함께 반환한다.
+  단일 문서(C→D) 경로에서는 안 쓰이고, F(`multi_table_extractor.py`)가 문서 전체를 사전 스캔해
+  `(preset_id, subject)` 메뉴를 구성할 때 사용한다
 
 </details>
 
@@ -199,7 +204,7 @@ PDF(텍스트 레이어) ─▶ pdf_to_table.py ─▶ text ┤
 <details>
 <summary><b>chunk_orchestrator.py</b> — [D] 청크 처리 (A-1/A-2 실행 진입점)</summary>
 
-- 컨텍스트 한도(gpt-oss:120b-cloud 기준 128K 토큰, `--model-context-tokens`로 변경 가능) 초과 여부 판단
+- 컨텍스트 한도(기본값 60,000 토큰 — `DEFAULT_MODEL_CONTEXT_TOKENS`, `--model-context-tokens`로 변경 가능) 초과 여부 판단
   - 안 넘으면: 청크 없이 `scan_schema()` + `extract_table()` 그대로
   - 넘으면: 문단/문장 경계로 분할(overlap 포함) → **스키마는 대표 청크로 1회만** → 청크마다 동일 스키마로 추출 → 느슨한 정규화(공백/기호 제거, 임베딩 없음)로 병합 → 병합 표 재검증
 - `--resume` + `.jsonl` 체크포인트: 항목 처리 즉시 저장, 중단돼도 이어서 처리
@@ -231,22 +236,33 @@ PDF(텍스트 레이어) ─▶ pdf_to_table.py ─▶ text ┤
 
 - 지금까지의 파이프라인(C→D)은 "텍스트 1개 → 표 1개"로 고정돼 있었다. 인물/사건/시간축이
   여러 겹인 문서는 표 하나로 다 담으면 정보가 눌려서 결과가 얕아진다는 문제의식에서 출발
+- **1단계 — 사전 스캔 (메뉴 구성)**: `scan_all_segments_for_presets()`가 문서 전체를
+  `--classification-sample-chars` 크기의 구간으로 나눠 **구간마다 한 번씩 전부** 분류한다.
+  `preset_classifier`가 구간별로 반환하는 `subjects`(핵심 대상/사건, 최대 3개) 배열을 펼쳐서
+  `(preset_id, subject)` 조합 하나하나를 독립된 표 추출 후보로 삼고, 같은 조합이 여러 구간에
+  걸쳐 있으면 구간 인덱스를 모아 하나의 메뉴 항목으로 합친다. 이렇게 문서 전체를 대상으로
+  "이 문서에 표로 만들 만한 관점이 몇 개나 있는지"를 미리 확정한다 — 이전 버전처럼 회차마다
+  다시 분류하며 즉흥적으로 관점을 피해가는 방식(`avoid_note`)이 아니다
+- **2단계 — 메뉴 순회 추출**: 메뉴 항목을 순서대로 소비하면서, 해당 subject가 나온 구간(과
+  맥락 유지를 위한 앞뒤 버퍼 구간 각 1개)만 발췌해 `target_text`로 조립하고, D(`process_document`)에
+  `context_before`로 "이 표는 오직 '{subject}' 관련 정보만 담아라"는 `focus_prompt`를 주입해
+  추출한다. 문서 전체가 아니라 그 subject와 관련된 구간만 보여주므로 한 표 안에 무관한 정보가
+  섞이는 걸 프롬프트 단계에서 막는다
 - 표를 하나 뽑을 때마다 **E(round-trip)의 누락 체크를 정지 신호로 재활용**한다 — 표를 다시
   장문으로 복원해, 원문의 salient token(숫자/날짜/개체명)이 지금까지 뽑은 표들로 얼마나
   커버됐는지 측정하고, 목표 coverage(`--coverage-stop-threshold`, 기본 0.9)에 도달하면 멈춘다.
   새 검증 장치를 만들지 않고 이미 있는 E 인프라를 반복 실행의 정지 조건으로 쓰는 것
 - "몇 개의 표가 필요한지"를 LLM 판단에 맡기지 않고 측정된 coverage 수치로 결정 — "LLM
   자기절제를 믿지 않는다"는 설계 원칙을 그대로 잇는다
-- 회차마다 다른 preset을 유도하기 위해, 직전까지 뽑은 표들의 preset/컬럼(그리고
-  `vertical_entity`/`listing`/`event_timeline`처럼 컬럼명이 고정된 preset은 행 라벨 예시까지)을
-  프롬프트에 `avoid_note`로 넣어 같은 관점의 표 재추출을 회피시킴
-- 분류용 샘플을 문서 전체에서 구간별로 순환시켜(`--classification-sample-chars`), 매 회차
-  똑같은 앞부분만 보고 뒷부분 정보를 놓치는 문제를 막음
 - coverage 정체(새로 커버된 토큰 0개)만으로 멈추면 숫자가 적은 서사 텍스트에서 오판할 수 있어,
   이 표의 행 라벨이 지금까지 하나도 안 나온 새로운 것인지(`row_key_novelty_ratio`)를 보조
   신호로 같이 봄
+- 메뉴 항목 자체가 이미 서로 다른 관점(preset/subject)이라 중복 가능성은 줄었지만,
+  `vertical_entity`/`listing`/`event_timeline`처럼 컬럼명이 고정된 preset은 그래도 행 라벨(내용)
+  겹침 비율로 `_is_duplicate_structure()`가 한 번 더 걸러낸다
 - `--max-tables`(기본 10, 0=무제한)는 비용 상한이고 coverage 기반 정지와는 별개 레이어 —
-  0을 줘도 내부 안전판(`DEFAULT_HARD_SAFETY_LIMIT`, 50개)은 항상 걸림
+  0을 줘도 내부 안전판(`DEFAULT_HARD_SAFETY_LIMIT`, 50개)은 항상 걸리며, 메뉴 자체가 더
+  작으면 메뉴 소진으로 먼저 끝남
 - `--genre {informative,narrative}`, 그리고 D로 그대로 전달되는 청크 관련 옵션
   (`--model-context-tokens`, `--quality-chunk-tokens` 등)을 모두 지원
 
@@ -450,9 +466,19 @@ token이 얼마나 남아있는지 재는 것)가 정확히 이 역할을 할 �
 겹치는 비율로 중복을 재도록 고쳤다. 다른 하나는 coverage만으로 정체를 판단하면
 숫자·날짜가 적은 서사 텍스트에서 오판할 수 있다는 점이라, 이 표가 실제로 새로운
 행 라벨(개체/속성)을 다뤘는지를 보조 신호(`row_key_novelty_ratio`)로 같이 보게
-했다. 회차마다 분류용 샘플을 문서의 다른 구간으로 순환시킨 것도 같은 맥락 —
-안 그러면 `preset_classifier`의 샘플 길이 제한 때문에 매 회차 똑같은 앞부분만
-보고, 뒷부분에 있는 서로 다른 정보를 영영 못 보게 된다.
+했다.
+
+**추가 개선 (avoid_note 방식 → 사전 스캔+메뉴 방식)**: 처음 버전은 회차마다
+분류용 샘플을 문서의 다른 구간으로 순환시키고, 직전까지 뽑은 표의 preset/컬럼을
+`avoid_note`로 프롬프트에 넣어 "이미 뽑은 관점은 피하라"고 즉흥적으로 유도하는
+방식이었다. 안 그러면 `preset_classifier`의 샘플 길이 제한 때문에 매 회차 똑같은
+앞부분만 보고 뒷부분 정보를 영영 못 보는 문제가 있었기 때문이다. 이후 이 방식을
+`scan_all_segments_for_presets()` 기반의 **사전 스캔 + 메뉴** 구조로 교체했다 —
+매 회차 즉흥적으로 회피시키는 대신, 문서 전체 구간을 처음에 한 번씩 다 분류해
+`(preset_id, subject)` 조합의 메뉴를 미리 확정하고, 이후에는 그 메뉴를 순서대로
+소진한다. 각 메뉴 항목은 해당 subject가 등장한 구간만 발췌해서 추출하므로,
+"이번엔 뭘 피해야 하나"를 매번 프롬프트로 설득하는 대신 애초에 서로 다른
+구간/주제를 보게 만드는 구조적 해법이다.
 
 ### 10. PDF 입력 경로 분리 — "표 추출용"과 "텍스트 추출용"은 다른 문제다
 `pdf_table_extractor.py`(docling)는 PDF 안에 이미 있는 표의 구조 자체를

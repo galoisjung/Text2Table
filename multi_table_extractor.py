@@ -284,16 +284,42 @@ def extract_multiple_tables(
         all_row_keys_seen |= _extract_row_keys(table_markdown)
 
         coverage_ratio = len(covered) / len(salient_tokens) if salient_tokens else 1.0
-        tables.append({
-            "preset_id": preset_id,
-            "classification": classification,
-            "table_markdown": table_markdown,
-            "expected_columns": expected_columns,
-            "chunked": extraction.get("chunked"),
-            "newly_covered_count": len(newly_covered),
-            "cumulative_coverage": round(coverage_ratio, 3),
-            "row_key_novelty_ratio": round(novelty_ratio, 3),
-        })
+
+        # ── 주제 섞임 감지 결과 반영 ──
+        # D(process_document)가 이미 병합된 표 전체에 대해 한 번 감지해뒀다.
+        # mixed=True면 이 하나의 추출 결과를 여러 개의 최종 표 항목으로 쪼개서
+        # 담는다 -- coverage/novelty는 병합본(같은 내용) 기준으로 이미 계산했으므로
+        # 재계산하지 않고 모든 조각에 동일하게 붙인다 (같은 내용을 나눈 것뿐이므로
+        # 중복 집계가 아니다).
+        subject_split = extraction.get("subject_split")
+        if subject_split and subject_split.get("mixed"):
+            sub_labels = [t["label"] for t in subject_split["tables"]]
+            print(f"    -> 주제 섞임 감지 -- {len(sub_labels)}개 표로 분리: {sub_labels}")
+            for sub in subject_split["tables"]:
+                tables.append({
+                    "preset_id": preset_id,
+                    "classification": classification,
+                    "label": f"{target_subject} - {sub['label']}" if target_subject else sub["label"],
+                    "table_markdown": sub["table_markdown"],
+                    "expected_columns": expected_columns,
+                    "chunked": extraction.get("chunked"),
+                    "newly_covered_count": len(newly_covered),
+                    "cumulative_coverage": round(coverage_ratio, 3),
+                    "row_key_novelty_ratio": round(novelty_ratio, 3),
+                    "split_from_subject": target_subject,
+                })
+        else:
+            tables.append({
+                "preset_id": preset_id,
+                "classification": classification,
+                "label": target_subject or None,
+                "table_markdown": table_markdown,
+                "expected_columns": expected_columns,
+                "chunked": extraction.get("chunked"),
+                "newly_covered_count": len(newly_covered),
+                "cumulative_coverage": round(coverage_ratio, 3),
+                "row_key_novelty_ratio": round(novelty_ratio, 3),
+            })
         print(f"    -> preset={preset_id}, 새로 커버된 토큰={len(newly_covered)}, "
               f"누적 coverage={coverage_ratio:.2f}, 행 라벨 신선도={novelty_ratio:.2f}")
 
@@ -335,7 +361,10 @@ def build_report_markdown(input_name: str, text: str, result: dict) -> str:
     lines.append(f"**정지 사유**: {result['stop_reason']}\n")
 
     for i, t in enumerate(result["tables"], 1):
-        lines.append(f"## 표 {i} — preset: {t['preset_id']}\n")
+        title = f"## 표 {i} — preset: {t['preset_id']}"
+        if t.get("label"):
+            title += f" ({t['label']})"
+        lines.append(title + "\n")
         lines.append(f"- 컬럼: {t['expected_columns']}")
         lines.append(f"- 이 표로 새로 커버된 원문 토큰 수: {t['newly_covered_count']}")
         lines.append(f"- 누적 coverage: {t['cumulative_coverage']}\n")
@@ -407,6 +436,11 @@ def main():
         help="D 단계로 그대로 전달됨. 지정하면 컨텍스트 오버플로 여부와 무관하게 이 "
              "크기로 청크를 강제 분할한다 (lost-in-the-middle/context rot 완화용)."
     )
+    parser.add_argument(
+        "--no-subject-split", action="store_true",
+        help="D 단계로 그대로 전달됨. 표(vertical_entity/listing)에 섞인 주제를 감지해 "
+             "여러 표로 나누는 동작을 끈다. 기본은 켜져 있음."
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -425,6 +459,7 @@ def main():
             "quality_chunk_tokens": args.quality_chunk_tokens,
         }.items() if v is not None
     }
+    chunk_kwargs["check_subject_split"] = not args.no_subject_split
 
     result = extract_multiple_tables(
         text,

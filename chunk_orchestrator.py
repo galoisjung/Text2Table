@@ -36,6 +36,7 @@ from pathlib import Path
 from preset_library import PRESETS
 from schema_extract import extract_table, parse_markdown_table, resolve_final_columns, validate_extraction
 from schema_scan import scan_schema, build_schema_scan_prompt, call_ollama_scan, apply_budget_policy
+from subject_split import detect_subject_split, split_rows_by_group, APPLICABLE_PRESETS as SUBJECT_SPLIT_PRESETS
 
 # gpt-oss:120b-cloud 실측 context_length (Ollama 모델 메타데이터 기준)
 DEFAULT_MODEL_CONTEXT_TOKENS = 60000
@@ -45,6 +46,7 @@ DEFAULT_CHUNK_OVERLAP_RATIO = 0.1
 DEFAULT_SCHEMA_SCAN_SAMPLE_CHUNKS = 0
 DEFAULT_QUALITY_CHUNK_TOKENS = None  # None = 오버플로 예산과 동일(기존 동작). 값을 주면 그보다 훨씬
                                       # 보수적으로 청크 크기를 강제 (lost-in-the-middle/context rot 완화용)
+DEFAULT_CHECK_SUBJECT_SPLIT = True   # 최종 표에 대해 주제 섞임 감지(subject_split.py)를 돌릴지 여부
 
 
 # ─────────────────────────────────────────────────────────────
@@ -220,6 +222,50 @@ def rows_to_markdown(header: list[str], rows: list[dict]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# 3.6. 주제 섞임 감지 + 분리 (최종 표에 대해 1회, vertical_entity/listing만)
+#      -- preset(모양)은 맞아도 "하나의 주제"라는 전제가 실제로 깨진 경우
+#      (예: 책 정보 표에 등장인물 정보가 섞임)를 잡아 별도 표로 나눈다.
+# ─────────────────────────────────────────────────────────────
+def maybe_split_by_subject(
+    preset_id: str,
+    header: list[str],
+    rows: list[dict],
+    llm_kwargs: dict,
+) -> dict | None:
+    if preset_id not in SUBJECT_SPLIT_PRESETS or not rows:
+        return None
+
+    preset = PRESETS[preset_id]
+    row_key_col = next((c.name for c in preset.core_columns if c.role == "row_key"), None)
+    if row_key_col is None or row_key_col not in header:
+        return None
+
+    row_key_items = [r.get(row_key_col, "") for r in rows]
+    try:
+        detection = detect_subject_split(preset_id, row_key_items, **llm_kwargs)
+    except Exception as e:
+        print(f"    [경고] 주제 섞임 감지 실패, 건너뜁니다 (원래 표를 그대로 유지): {e}")
+        return {"checked": False, "error": str(e)}
+
+    if detection.get("skipped") or detection.get("error") or not detection.get("mixed"):
+        return {"checked": True, "mixed": False, "detail": detection}
+
+    groups = split_rows_by_group(header, rows, row_key_col, detection["accepted_groups"])
+    sub_tables = [
+        {
+            "label": g["label"],
+            "table_markdown": rows_to_markdown(g["header"], g["rows"]),
+            "row_count": len(g["rows"]),
+        }
+        for g in groups
+    ]
+    labels = [t["label"] for t in sub_tables]
+    print(f"    [경고] 주제 섞임 감지됨 -- {len(sub_tables)}개 표로 분리: {labels}")
+
+    return {"checked": True, "mixed": True, "detail": detection, "tables": sub_tables}
+
+
+# ─────────────────────────────────────────────────────────────
 # 3.5. 전체 청크 스캔 (schema_scan_sample_chunks=0일 때)
 #      -- 청크들을 다시 이어붙이면 스캔 프롬프트 자체가 컨텍스트 예산을
 #      넘어버리므로, 청크마다 "개별적으로" 스캔한 뒤 후보를 느슨한
@@ -278,6 +324,7 @@ def process_document(
     chunk_overlap_ratio: float = DEFAULT_CHUNK_OVERLAP_RATIO,
     schema_scan_sample_chunks: int = DEFAULT_SCHEMA_SCAN_SAMPLE_CHUNKS,
     quality_chunk_tokens: int | None = DEFAULT_QUALITY_CHUNK_TOKENS,
+    check_subject_split: bool = DEFAULT_CHECK_SUBJECT_SPLIT,
 ) -> dict:
     preset = PRESETS.get(preset_id)
     if preset is None:
@@ -306,7 +353,14 @@ def process_document(
             preset_id, full_text, accepted_extension=accepted,
             context_before=context_before, context_after=context_after, **llm_kwargs,
         )
-        return {"chunked": False, "num_chunks": 1, "scan": scan_result, **extract_result}
+        subject_split = None
+        if check_subject_split:
+            header, rows = parse_markdown_table(extract_result.get("table_markdown", ""))
+            subject_split = maybe_split_by_subject(preset_id, header, rows, llm_kwargs)
+        return {
+            "chunked": False, "num_chunks": 1, "scan": scan_result,
+            "subject_split": subject_split, **extract_result,
+        }
 
     # ── 청크 분할 ──
     chunks = chunk_text(full_text, budget, chunk_overlap_ratio, chars_per_token)
@@ -360,6 +414,11 @@ def process_document(
     # ── 병합된 전체 표에 대해 검증 재실행 (청크 단위 검증으로는 청크 간 중복을 못 잡음) ──
     final_validation = validate_extraction(preset_id, header, merged_rows, expected_columns)
 
+    # ── 주제 섞임 감지 (청크마다가 아니라 병합된 최종 표 전체에 대해 1회만) ──
+    subject_split = None
+    if check_subject_split:
+        subject_split = maybe_split_by_subject(preset_id, header, merged_rows, llm_kwargs)
+
     return {
         "chunked": True,
         "preset_id": preset_id,
@@ -371,6 +430,7 @@ def process_document(
         "merge_conflicts": conflicts,
         "table_markdown": merged_markdown,
         "validation": final_validation,
+        "subject_split": subject_split,
     }
 
 
@@ -435,6 +495,11 @@ def main():
         "--schema-scan-sample-chunks", type=int, default=DEFAULT_SCHEMA_SCAN_SAMPLE_CHUNKS,
         help="A-1 스캔에 쓸 앞부분 청크 개수. 0 이하로 주면 모든 청크를 개별 스캔 후 "
              "합산한다 (문서 전체 대상 스캔, 호출 수는 늘어남)."
+    )
+    parser.add_argument(
+        "--no-subject-split", action="store_true",
+        help="최종 표(vertical_entity/listing)에 대해 주제 섞임 감지+분리(subject_split.py)를 "
+             "돌리지 않는다. 기본은 켜져 있음."
     )
     parser.add_argument(
         "--resume",
@@ -505,6 +570,7 @@ def main():
                 chunk_overlap_ratio=args.chunk_overlap_ratio,
                 schema_scan_sample_chunks=args.schema_scan_sample_chunks,
                 quality_chunk_tokens=args.quality_chunk_tokens,
+                check_subject_split=not args.no_subject_split,
                 **llm_kwargs,
             )
         except Exception as e:
@@ -527,6 +593,10 @@ def main():
             print(f"    [경고] row_key 중복 {len(v['duplicate_keys'])}건: {v['duplicate_keys'][:3]}")
         if v.get("row_unit_mismatch_warning"):
             print(f"    [경고] {v['row_unit_mismatch_warning']}")
+        ss = result.get("subject_split")
+        if ss and ss.get("mixed"):
+            labels = [t["label"] for t in ss["tables"]]
+            print(f"    [경고] 주제 섞임 -> {len(labels)}개 표로 분리됨: {labels}")
 
     # 재개로 쌓였을 수 있는 중복/실패 잔여 라인을 정리하기 위해 최종 결과 기준으로 재작성
     with open(jsonl_path, "w", encoding="utf-8") as f:
