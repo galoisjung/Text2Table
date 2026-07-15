@@ -2,7 +2,8 @@
 
 임의의 장문(기사·논문·소설·일기·보고서)을 구조화된 표로 변환하는 파이프라인.
 표 → 장문 round-trip을 최종 산출물이 아니라 **추출 파이프라인을 디버깅하는 진단
-도구**로 쓰는 것이 핵심 아이디어다.
+도구**로 쓰는 것이 핵심 아이디어다. 이 진단 도구는 표 1개짜리 추출뿐 아니라,
+한 문서에서 표를 몇 개까지 뽑을지 정하는 정지 조건(F단계)으로도 재사용된다.
 
 ---
 
@@ -61,6 +62,20 @@ python chunk_orchestrator.py --longtext longtext_out/tables_longtext.json --clas
 python roundtrip_verify.py --longtext longtext_out/tables_longtext.json --extracted chunk_extract_result.json --resume
 ```
 
+텍스트 레이어가 있는 PDF 하나를 바로 표로 바꾸고 싶을 때(docling 없이, 가볍게):
+
+```bash
+python pdf_to_table.py --input novel.pdf                        # 표 1개
+python pdf_to_table.py --input novel.pdf --multi                # 표 여러 개(F단계)
+python pdf_to_table.py --input novel.pdf --multi --max-tables 0 --genre narrative  # 무제한, 서사체
+```
+
+한 장문에서 표를 여러 개(F단계) 뽑고 싶을 때:
+
+```bash
+python multi_table_extractor.py --input novel.txt --max-tables 0
+```
+
 ---
 
 ## 파이프라인 한눈에 보기
@@ -74,26 +89,40 @@ python roundtrip_verify.py --longtext longtext_out/tables_longtext.json --extrac
 | **A-2** | `schema_extract.py` | 최종 표 추출 *(D가 내부 호출)* | 스키마 + long_text | `table_markdown` |
 | **D** | `chunk_orchestrator.py` | A-1/A-2 실행 진입점, 긴 문서 청크 분할·병합 | `preset_classification.json` | `chunk_extract_result.json` |
 | **E** | `roundtrip_verify.py` | round-trip 자기검증 (환각/누락) | `chunk_extract_result.json` | `roundtrip_verify_result.json/md` |
+| **F** | `multi_table_extractor.py` | 한 장문에서 표 여러 개 반복 추출 (E의 누락 체크를 정지 신호로 재사용) | `.txt` 파일 | `{name}.multitable.md/json` |
 | **통합** | `text_to_table.py` | 텍스트 파일 하나에 C→D만 실행 (E는 관심사 분리로 별도 실행) | `.txt` 파일 | `{name}.table.md/json` |
+| **통합** | `pdf_to_table.py` | 텍스트 레이어가 있는 PDF → 텍스트 → `text_to_table.py`/`multi_table_extractor.py` | PDF 파일 | `{name}.table.md/json` 또는 `.multitable.md/json` |
 
 > `schema_scan.py`/`schema_extract.py`의 CLI는 실제 실행 경로에서 안 쓴다.
 > `chunk_orchestrator.py`가 두 파일의 함수를 직접 import해서 쓰기 때문 —
 > 이 둘의 CLI는 A-1/A-2만 따로 떼어 디버깅할 때 쓰는 격리 도구다.
 
 ```
-PDF ─▶ 표(Markdown) ─▶ long_text ┐
-                                  │  (진짜 목표는 여기서부터)
-                                  ▼
-                    C: preset 분류
-                                  ▼
-                    D: 스키마 제안(A-1) → 추출(A-2) → [청크 병합]
-                                  ▼
-                    E: round-trip 자기검증 (선택 · 별도 실행)
+PDF(표 추출용) ─▶ 표(Markdown) ─▶ long_text ┐
+                                              │  (진짜 목표는 여기서부터)
+PDF(텍스트 레이어) ─▶ pdf_to_table.py ─▶ text ┤
+                                              │
+                     순수 .txt ───────────────┘
+                                              ▼
+                                C: preset 분류
+                                              ▼
+                                D: 스키마 제안(A-1) → 추출(A-2) → [청크 병합]
+                                    │                        ▼
+                                    │           E: round-trip 자기검증 (선택 · 별도 실행)
+                                    ▼
+                     F: 표 여러 개 반복 추출 (내부에서 C→D→E 반복, coverage로 정지)
 ```
 
 > `text_to_table.py`는 C→D까지만 자동 실행한다. 검증(E)이 필요하면
 > `roundtrip_verify.py`를 별도로 돌린다 — 표 변환과 검증을 분리해서, 검증이
 > 필요 없는 경우 LLM 호출을 아낄 수 있게 했다.
+> `multi_table_extractor.py`(F)는 회차마다 C→D를 새로 돌리고, E의 누락 체크
+> 로직(재-verbalize 후 coverage 측정)을 표를 더 뽑을지 멈출지 정하는 정지
+> 신호로 재사용한다. `pdf_to_table.py`는 텍스트 레이어가 있는 PDF를 pypdf로
+> 가볍게 텍스트만 뽑아 `text_to_table.py`(표 1개) 또는
+> `multi_table_extractor.py`(표 여러 개, `--multi`)로 넘기는 얇은 통합
+> 스크립트다 — docling 기반 표 추출(`pdf_table_extractor.py`)과는 별개
+> 경로이며, 스캔본(이미지 PDF)은 지원하지 않는다.
 
 ---
 
@@ -134,6 +163,10 @@ PDF ─▶ 표(Markdown) ─▶ long_text ┐
 - `{stem}_tables.md`를 읽어 표를 로컬 Ollama LLM으로 한국어 장문 서술
 - `--check-coverage`: 표의 모든 값이 장문에 최소 1회 언급됐는지 검증
 - 원본 `table_markdown`도 결과에 저장 → E 단계에서 "정답"으로 재사용됨
+- `--genre {informative,narrative}`: 서술 문체 전환. `informative`(기본)는
+  보고서/논문체 설명 문단, `narrative`는 시간·인과관계가 드러나는 이야기체
+  문장으로 풀어 쓴다. 같은 옵션이 E(`roundtrip_verify.py`)와
+  F(`multi_table_extractor.py`)의 재-verbalize 단계에도 그대로 전달된다
 
 </details>
 
@@ -188,6 +221,34 @@ PDF ─▶ 표(Markdown) ─▶ long_text ┐
 - **누락 체크(진짜 round-trip)**: 표를 다시 장문으로 복원 → 원문의 숫자/날짜/퍼센트가 복원문에 남아있는가. **원본 표 없이도 동작**하는 유일한 검증이라 "임의의 장문 → 표"에 일반화됨
 - `--resume`, `--report-only`(LLM 재호출 없이 `.jsonl`만으로 리포트 재생성), `Ctrl+C` 시에도 그때까지 결과 저장
 - `.md` 리포트: 원문 / 정답 표(원본) / 재구성된 표 / 복원된 장문 / 검증 수치를 항목별로 나란히 표시
+- `--genre {informative,narrative}`: 누락 체크용 재-verbalize 문체 (기본 `informative`)
+- `--no-ner`: salient token 추출 시 숫자/날짜/퍼센트 외에 개체명(NER)까지 포함할지 여부 (기본 포함)
+
+</details>
+
+<details>
+<summary><b>multi_table_extractor.py</b> — [F] 한 장문에서 표 여러 개 반복 추출</summary>
+
+- 지금까지의 파이프라인(C→D)은 "텍스트 1개 → 표 1개"로 고정돼 있었다. 인물/사건/시간축이
+  여러 겹인 문서는 표 하나로 다 담으면 정보가 눌려서 결과가 얕아진다는 문제의식에서 출발
+- 표를 하나 뽑을 때마다 **E(round-trip)의 누락 체크를 정지 신호로 재활용**한다 — 표를 다시
+  장문으로 복원해, 원문의 salient token(숫자/날짜/개체명)이 지금까지 뽑은 표들로 얼마나
+  커버됐는지 측정하고, 목표 coverage(`--coverage-stop-threshold`, 기본 0.9)에 도달하면 멈춘다.
+  새 검증 장치를 만들지 않고 이미 있는 E 인프라를 반복 실행의 정지 조건으로 쓰는 것
+- "몇 개의 표가 필요한지"를 LLM 판단에 맡기지 않고 측정된 coverage 수치로 결정 — "LLM
+  자기절제를 믿지 않는다"는 설계 원칙을 그대로 잇는다
+- 회차마다 다른 preset을 유도하기 위해, 직전까지 뽑은 표들의 preset/컬럼(그리고
+  `vertical_entity`/`listing`/`event_timeline`처럼 컬럼명이 고정된 preset은 행 라벨 예시까지)을
+  프롬프트에 `avoid_note`로 넣어 같은 관점의 표 재추출을 회피시킴
+- 분류용 샘플을 문서 전체에서 구간별로 순환시켜(`--classification-sample-chars`), 매 회차
+  똑같은 앞부분만 보고 뒷부분 정보를 놓치는 문제를 막음
+- coverage 정체(새로 커버된 토큰 0개)만으로 멈추면 숫자가 적은 서사 텍스트에서 오판할 수 있어,
+  이 표의 행 라벨이 지금까지 하나도 안 나온 새로운 것인지(`row_key_novelty_ratio`)를 보조
+  신호로 같이 봄
+- `--max-tables`(기본 10, 0=무제한)는 비용 상한이고 coverage 기반 정지와는 별개 레이어 —
+  0을 줘도 내부 안전판(`DEFAULT_HARD_SAFETY_LIMIT`, 50개)은 항상 걸림
+- `--genre {informative,narrative}`, 그리고 D로 그대로 전달되는 청크 관련 옵션
+  (`--model-context-tokens`, `--quality-chunk-tokens` 등)을 모두 지원
 
 </details>
 
@@ -201,6 +262,25 @@ PDF ─▶ 표(Markdown) ─▶ long_text ┐
 - 인코딩 자동 판별(UTF-8→UTF-8-BOM→CP949), HTTP 5xx 자동 재시도
 - `.md` 리포트의 원문은 줄마다 blockquote 처리해, 여러 문단짜리 텍스트도 중간에
   끊긴 것처럼 안 보이고 전체가 다 보이게 함
+
+</details>
+
+<details>
+<summary><b>pdf_to_table.py</b> — 통합: 텍스트 레이어가 있는 PDF → 표</summary>
+
+- 새로 만든 부분은 "PDF → 텍스트"뿐이다. `pypdf`로 페이지 순서대로 텍스트 레이어만 가볍게
+  긁어 이어붙이고, 이후 오케스트레이션은 `text_to_table.py`의 `convert_text_to_table()`
+  (표 1개, 기본) 또는 `multi_table_extractor.py`의 `extract_multiple_tables()`(`--multi`,
+  표 여러 개/F단계)를 그대로 가져다 쓴다 — 같은 로직을 두 번 짜지 않음
+- **`pdf_table_extractor.py`(docling 기반)와는 다른 경로**다. 그쪽은 PDF 안의 표 구조 자체를
+  뽑아내는 게 목적(→ round-trip 진단용 long_text 생성)이고, 이쪽은 "이미 표가 아니라 장문으로
+  서술된 PDF"를 텍스트로 펼쳐서 C→D(→F)에 바로 태우는 게 목적
+- 스캔본(이미지 PDF, 텍스트 레이어 없음)은 지원 범위 밖 — 페이지당 평균 추출 문자 수가
+  임계치(20자) 미만이면 스캔본으로 의심해 경고와 함께 중단한다 (`--force`로 강행 가능)
+- 추출된 텍스트를 `{name}.extracted.txt`로도 저장해, 필요하면 `text_to_table.py`/
+  `multi_table_extractor.py`를 이 파일에 직접 돌려 더 세밀한 옵션을 쓸 수 있게 함
+- `--multi`, `--max-tables`, `--coverage-stop-threshold`, `--genre` 등 F단계 옵션과
+  D단계(청크) 옵션을 모두 그대로 전달받아 넘김
 
 </details>
 
@@ -349,6 +429,43 @@ recurrence 집계나 A-2 전체 추출 같은 작업이 여기 가장 취약한 
 새로운 이점이 없기 때문이다. 이 값을 지정 안 하면 예전과 동일하게 동작하도록
 기본값은 `None`으로 뒀다.
 
+### 9. F — 표 1개의 한계, 그리고 새 인프라 대신 E를 반대로 다시 쓴다
+C→D는 처음부터 "텍스트 1개 → 표 1개"를 전제로 설계됐다. 그런데 인물도 여러 명,
+사건도 여러 개, 시간 흐름도 있는 소설·보고서를 표 하나에 눌러 담으면 결과가
+얕아 보인다는 문제가 실제 데이터에서 나왔다. "표를 몇 개 뽑아야 충분한가"를
+LLM의 자기 판단에 맡기지 않는다는 원칙(5번 항목)을 여기서도 지키려면, 정지
+조건을 측정 가능한 수치로 만들어야 했다.
+
+7번 항목에서 만든 E의 누락 체크(표를 다시 장문으로 복원해 원문 salient
+token이 얼마나 남아있는지 재는 것)가 정확히 이 역할을 할 수 있었다 — 표를 하나
+뽑을 때마다 그 표를 복원해서 "지금까지 뽑은 표들이 원문을 얼마나 커버했는가"를
+누적으로 재고, 목표 coverage에 도달하거나 더 이상 새 정보가 안 늘어나면 멈춘다.
+새 검증 인프라를 만들지 않고 기존 걸 반복 실행의 정지 신호로 재활용한 것(8번
+항목과 같은 패턴).
+
+실제로 돌려보니 두 가지 실패 모드가 나왔다. 하나는 `vertical_entity`/`listing`/
+`event_timeline`처럼 컬럼명이 문서 내용과 무관하게 항상 고정된 preset에서,
+"같은 구조(컬럼명 동일)면 중복"으로 판정하는 로직이 실제 내용이 완전히 달라도
+1개에서 멈춰버리는 문제였다(해리포터 텍스트로 재현) — 컬럼명 대신 행 라벨(내용)의
+겹치는 비율로 중복을 재도록 고쳤다. 다른 하나는 coverage만으로 정체를 판단하면
+숫자·날짜가 적은 서사 텍스트에서 오판할 수 있다는 점이라, 이 표가 실제로 새로운
+행 라벨(개체/속성)을 다뤘는지를 보조 신호(`row_key_novelty_ratio`)로 같이 보게
+했다. 회차마다 분류용 샘플을 문서의 다른 구간으로 순환시킨 것도 같은 맥락 —
+안 그러면 `preset_classifier`의 샘플 길이 제한 때문에 매 회차 똑같은 앞부분만
+보고, 뒷부분에 있는 서로 다른 정보를 영영 못 보게 된다.
+
+### 10. PDF 입력 경로 분리 — "표 추출용"과 "텍스트 추출용"은 다른 문제다
+`pdf_table_extractor.py`(docling)는 PDF 안에 이미 있는 표의 구조 자체를
+뽑아내는 게 목적이라 무겁다(레이아웃 분석, OCR 폴백 등). 그런데 "표가 아니라
+장문으로 서술된 PDF를 표로 바꾸고 싶다"는 요구에는 이 무게가 필요 없다 — 텍스트
+레이어만 그대로 펼치면 되는 문제라서, `pypdf`로 가볍게 텍스트만 뽑는
+`pdf_to_table.py`를 별도로 뒀다. 오케스트레이션(C→D, 필요하면 F까지)은
+`text_to_table.py`/`multi_table_extractor.py`의 함수를 그대로 재사용해서
+로직이 두 군데로 갈라지지 않게 했다. 스캔본(이미지 PDF)은 텍스트 레이어가
+없어 이 가벼운 경로로 처리할 수 없으므로, 페이지당 평균 추출 문자 수가
+너무 낮으면 스캔본으로 의심하고 명확히 중단한다 — 조용히 빈 표를 내보내는
+대신, 처리 범위 밖임을 알리는 쪽을 택했다.
+
 ### 핵심 통찰 요약
 
 - **Round-trip은 산출물이 아니라 디버깅 신호다.** 원본 표 없이도 "복원문에서
@@ -368,3 +485,50 @@ recurrence 집계나 A-2 전체 추출 같은 작업이 여기 가장 취약한 
 - **장시간 파이프라인은 중간 저장이 기본값이어야 한다.**
 - **"컨텍스트에 들어간다"와 "그 안에서 다 정확히 처리한다"는 다른 문제다.**
   한도를 꽉 채우기보다, 처리 품질을 기준으로 별도의 청크 크기를 정하는 게 낫다.
+- **"몇 개가 충분한가"도 LLM 판단이 아니라 측정치로 결정한다.** F단계에서
+  "표를 몇 개 더 뽑을지"를 E의 누락 체크(coverage)로 재활용해 정지 조건을
+  삼은 것도 결국 "LLM 자기절제를 믿지 않는다"는 같은 원칙의 확장이다.
+- **"컨텍스트에 다 들어가는 문제"와 "표 구조 자체를 뽑는 문제"는 다른
+  무게를 요구한다.** PDF에서 표 자체를 뽑아야 하면 docling(무거움)이,
+  이미 서술된 텍스트를 표로 바꾸기만 하면 되면 텍스트 레이어 추출(가벼움)이
+  맞는 도구다 — 목적에 맞지 않는 무거운 경로를 기본값으로 두지 않았다.
+
+---
+
+## 알려진 한계
+
+- **자유 스키마(schema-free) 경로 없음**: C(`preset_classifier.py`)가 신뢰도
+  부족으로 `preset_id=None`(폴백)을 반환하면, `text_to_table.py`/
+  `pdf_to_table.py`/`multi_table_extractor.py` 모두 명확한 사유와 함께
+  중단한다. preset 5종 중 어디에도 안 맞는 문서를 위한 "프리셋 없이 A만
+  단독으로 스키마를 도출하는" 경로는 아직 구현돼 있지 않다.
+- **스캔본(이미지) PDF 미지원**: `pdf_to_table.py`는 텍스트 레이어가 있는
+  PDF만 다룬다. 이미지 기반 PDF는 `--force`로 강행해도 텍스트가 거의 안
+  나와 의미 있는 결과를 못 만든다 — 표 구조까지 필요하면 docling 기반
+  `pdf_table_extractor.py` 쪽을 검토해야 한다.
+- **청크 병합은 느슨한 정규화(공백/기호 제거)만 쓴다**: 임베딩 유사도 매칭은
+  의도적으로 아직 도입하지 않았다. 정확 일치로 안 잡히는 표기 차이 사례가
+  실제로 쌓이면 그때 검토하기로 한 결정이다.
+- **F단계 정지 조건은 휴리스틱이다**: coverage 임계치(`--coverage-stop-threshold`)와
+  행 라벨 신선도(`row_key_novelty_ratio`) 두 신호로 정지 시점을 정하지만,
+  둘 다 완벽한 판정 기준은 아니다. `--max-tables`/내부 안전판(50개)이 최종
+  방어선 역할을 한다.
+
+---
+
+## 설치
+
+```bash
+pip install -r requirement.txt
+```
+
+- `requirement.txt`는 UTF-16(LE) 인코딩으로 저장돼 있다 — `pip`은 이를 문제
+  없이 읽지만, 직접 열어서 편집할 때는 에디터가 UTF-16으로 인식하는지 확인할 것.
+- PDF에서 표 구조 자체를 뽑는 경로(`pdf_table_extractor.py`)는 `docling`/
+  `paddleocr`/`paddlepaddle` 등 무거운 의존성이 필요하다. 텍스트 레이어만
+  가볍게 뽑는 `pdf_to_table.py`는 `pypdf`만 있으면 된다.
+  주의: `pdf_to_table.py`는 `pypdf`를 import하지만 `requirement.txt`에는
+  `pypdfium2`(다른 패키지)만 있고 `pypdf`가 빠져 있다 — `pdf_to_table.py`를
+  쓰려면 `pip install pypdf`를 별도로 실행해야 한다.
+- LLM 호출은 로컬에 설치된 Ollama가 담당한다 — 코드 의존성 설치와는 별개로
+  위의 "실행 환경 준비(Ollama Cloud)" 절차를 반드시 따라야 한다.
