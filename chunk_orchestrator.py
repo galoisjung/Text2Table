@@ -38,7 +38,7 @@ from schema_extract import extract_table, parse_markdown_table, resolve_final_co
 from schema_scan import scan_schema, build_schema_scan_prompt, call_ollama_scan, apply_budget_policy
 
 # gpt-oss:120b-cloud 실측 context_length (Ollama 모델 메타데이터 기준)
-DEFAULT_MODEL_CONTEXT_TOKENS = 30000
+DEFAULT_MODEL_CONTEXT_TOKENS = 60000
 DEFAULT_RESERVED_TOKENS = 6000  # 프롬프트 템플릿 + few_shot + 지시문 + 출력 여유분
 DEFAULT_CHARS_PER_TOKEN = 2.0   # 한국어 텍스트 근사치 (정확한 토크나이저 없을 때)
 DEFAULT_CHUNK_OVERLAP_RATIO = 0.1
