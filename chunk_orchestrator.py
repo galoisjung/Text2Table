@@ -38,11 +38,11 @@ from schema_extract import extract_table, parse_markdown_table, resolve_final_co
 from schema_scan import scan_schema, build_schema_scan_prompt, call_ollama_scan, apply_budget_policy
 
 # gpt-oss:120b-cloud 실측 context_length (Ollama 모델 메타데이터 기준)
-DEFAULT_MODEL_CONTEXT_TOKENS = 131072
+DEFAULT_MODEL_CONTEXT_TOKENS = 30000
 DEFAULT_RESERVED_TOKENS = 6000  # 프롬프트 템플릿 + few_shot + 지시문 + 출력 여유분
 DEFAULT_CHARS_PER_TOKEN = 2.0   # 한국어 텍스트 근사치 (정확한 토크나이저 없을 때)
 DEFAULT_CHUNK_OVERLAP_RATIO = 0.1
-DEFAULT_SCHEMA_SCAN_SAMPLE_CHUNKS = 2
+DEFAULT_SCHEMA_SCAN_SAMPLE_CHUNKS = 0
 DEFAULT_QUALITY_CHUNK_TOKENS = None  # None = 오버플로 예산과 동일(기존 동작). 값을 주면 그보다 훨씬
                                       # 보수적으로 청크 크기를 강제 (lost-in-the-middle/context rot 완화용)
 
@@ -331,15 +331,27 @@ def process_document(
     chunk_results = []
     all_rows: list[dict] = []
     header: list[str] = expected_columns
+    failed_chunks: list[int] = []
 
     for i, chunk in enumerate(chunks, 1):
         print(f"    [D] 청크 {i}/{len(chunks)} 추출 중...")
-        res = extract_table(preset_id, chunk, accepted_extension=accepted, **llm_kwargs)
+        try:
+            res = extract_table(preset_id, chunk, accepted_extension=accepted, **llm_kwargs)
+        except Exception as e:
+            print(f"    [경고] 청크 {i}/{len(chunks)} 추출 실패, 이 청크는 건너뜁니다 "
+                  f"(나머지 청크는 계속 진행): {e}")
+            failed_chunks.append(i)
+            chunk_results.append({"table_markdown": "", "validation": {}, "error": str(e)})
+            continue
         chunk_results.append(res)
         h, rows = parse_markdown_table(res["table_markdown"])
         if h:
             header = h  # 마지막으로 관찰된 실제 헤더를 최종 병합 기준으로 사용
         all_rows.extend(rows)
+
+    if failed_chunks:
+        print(f"    [경고] 총 {len(failed_chunks)}/{len(chunks)}개 청크 추출 실패 "
+              f"(청크 번호: {failed_chunks}) -- 해당 부분의 정보는 최종 표에서 빠질 수 있습니다.")
 
     # ── 병합 (느슨한 정규화, 임베딩 없음) ──
     merged_rows, conflicts = merge_rows_with_alias(all_rows, preset.key_uniqueness_columns)
@@ -352,6 +364,7 @@ def process_document(
         "chunked": True,
         "preset_id": preset_id,
         "num_chunks": len(chunks),
+        "failed_chunks": failed_chunks,
         "scan": scan_result,
         "expected_columns": expected_columns,
         "chunk_validations": [r.get("validation") for r in chunk_results],

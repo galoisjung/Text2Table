@@ -53,7 +53,7 @@ _VALID_ATTR = {"single_attribute", "multi_attribute", "not_applicable"}
 # ─────────────────────────────────────────────────────────────
 def build_classification_prompt(text: str, avoid_note: str = "") -> str:
     avoid_block = f"\n{avoid_note}\n" if avoid_note else ""
-    return f"""당신은 임의의 한국어 텍스트를 표로 정리하기 위한 사전 분석가입니다.
+    return f"""당신은 임의의 텍스트를 표로 정리하기 위한 사전 분석가입니다.
 아래 텍스트를 읽고, 이 텍스트를 표로 만든다면 표의 "모양"이 어떻게 되어야
 하는지 판단하는 세 가지 질문에 답하세요. 텍스트에 실제 표가 있었는지는
 중요하지 않습니다 — 순수한 서술문이라도 판단하세요. 아래 텍스트는 원문
@@ -107,6 +107,11 @@ def build_classification_prompt(text: str, avoid_note: str = "") -> str:
   날짜가 명시적 숫자로 안 나와도 사건이 순서대로 이어지면 timeseries다).
   이런 경우는 책 제목·저자 같은 "책 메타데이터"(vertical_entity)와 구분해야
   한다 -- 실제 이야기 전개 자체를 표로 만들 때는 event_timeline이 맞다.
+  
+[질문 4] subjects: 이 텍스트가 다루고 있는 핵심 대상이나 사건들을 배열 형태로 추출하세요. 자잘한 정보는 무시하고, '독립적인 표로 만들어질 자격이 있는' 굵직한 주제만 최대 3개까지만 뽑으세요. 
+(예: ['구글 스토리 도서', '알파벳 기업공개', '웨이모 기술 유출 소송'])
+
+  
 {avoid_block}
 아래 JSON 형식으로만 답하세요. 다른 설명이나 markdown 코드펜스는 쓰지 마세요.
 {{"focus": "...", "time_structure": "...", "attribute_count": "...", "confidence": 0.0에서 1.0 사이 숫자, "reasoning": "판단 근거 한 문장"}}

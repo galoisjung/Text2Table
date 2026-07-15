@@ -73,27 +73,6 @@ _MIN_ROW_KEY_NOVELTY_RATIO = 0.3  # 이 표의 행 라벨 중 최소 이 비율�
                                    # salient token 진전이 없어도 정체로 안 본다
 
 
-def build_avoidance_note(previous_tables: list[dict]) -> str:
-    if not previous_tables:
-        return ""
-    lines = [
-        "[참고] 이 텍스트에서는 이미 다음과 같은 관점으로 표를 추출했습니다. "
-        "가능하면 같은 개체/사건을 다른 관점(다른 행 기준)에서 보거나, "
-        "아직 표로 안 옮겨진 다른 정보를 찾아보세요:"
-    ]
-    for i, t in enumerate(previous_tables, 1):
-        cols = ", ".join(t.get("expected_columns", []))
-        line = f"{i}. preset={t['preset_id']}, 컬럼=[{cols}]"
-        if t["preset_id"] in _FIXED_SCHEMA_PRESETS:
-            # 컬럼명이 항상 같아서 그것만으론 구분이 안 되니, 실제로 어떤 내용을
-            # 다뤘는지(행 라벨 일부)까지 보여줘서 회피 방향을 구체적으로 잡아준다.
-            sample_keys = list(_extract_row_keys(t.get("table_markdown", "")))[:5]
-            if sample_keys:
-                line += f", 다룬 내용 예시=[{', '.join(sample_keys)}]"
-        lines.append(line)
-    return "\n".join(lines)
-
-
 def _is_duplicate_structure(
     preset_id: str, expected_columns: list[str], table_markdown: str, previous_tables: list[dict]
 ) -> bool:
@@ -136,6 +115,60 @@ def _row_key_novelty_ratio(table_markdown: str, all_row_keys_seen: set[str]) -> 
 # ─────────────────────────────────────────────────────────────
 # 2. 반복 추출 오케스트레이션
 # ─────────────────────────────────────────────────────────────
+def scan_all_segments_for_presets(
+        classification_segments: list[str],
+        llm_kwargs: dict,
+) -> list[dict]:
+    """
+    [1단계: 사전 스캔] 문서의 모든 구간을 한 번씩 분류해서, 이 문서에 존재하는
+    서로 다른 '표 구조 후보(preset) + 핵심 주제(subject)'의 "메뉴"를 만든다.
+
+    하나의 청크가 여러 주제(subjects 배열)를 반환할 수 있으며,
+    각각의 (preset_id, subject) 조합이 독립적인 표 추출 후보(메뉴)로 취급된다.
+    """
+    menu_dict: dict[str, dict] = {}
+
+    for idx, segment in enumerate(classification_segments):
+        print(f"    [F 사전스캔] 구간 {idx + 1}/{len(classification_segments)} 분류 중...")
+        try:
+            classification = classify_and_select_preset(
+                segment, sample_chars=len(segment) + 1, **llm_kwargs
+            )
+        except Exception as e:
+            print(f"    [경고] 구간 {idx + 1} 분류 실패, 건너뜀: {e}")
+            continue
+
+        preset_id = classification.get("preset_id")
+        # preset_classifier.py가 반환한 subjects 배열을 가져옴
+        subjects = classification.get("subjects") or []
+
+        if not preset_id:
+            continue
+
+        # [안전 장치] LLM이 preset은 잡았는데 subjects를 빈 배열로 주거나 누락했을 경우
+        # 파이프라인이 멈추지 않도록 임시 주제어로 폴백 처리
+        if not isinstance(subjects, list) or len(subjects) == 0:
+            subjects = ["(주제 미특정)"]
+
+        # 청크가 가진 여러 주제를 순회하며 각각의 메뉴판에 청크 인덱스를 추가
+        for subject in subjects:
+            # 프리셋과 주제의 조합을 고유 키로 사용 (예: "vertical_entity::구글 스토리 도서")
+            menu_key = f"{preset_id}::{subject}"
+
+            if menu_key not in menu_dict:
+                menu_dict[menu_key] = {
+                    "preset_id": preset_id,
+                    "classification": classification,
+                    "target_subject": subject,  # 이후 추출(A-2) 프롬프트에 활용 가능
+                    "segment_indices": set()
+                }
+
+            menu_dict[menu_key]["segment_indices"].add(idx)
+            print(f"        -> 후보 발견: {preset_id} / 주제: {subject} (구간 {idx + 1} 병합됨)")
+
+    # 추출 단계로 넘기기 위해 value들만 리스트로 변환하여 반환
+    return list(menu_dict.values())
+
 def extract_multiple_tables(
     text: str,
     max_tables: int | None = DEFAULT_MAX_TABLES,
@@ -157,48 +190,83 @@ def extract_multiple_tables(
     tables: list[dict] = []
     stop_reason = ""
 
-    # 분류용 텍스트를 문서 전체에서 구간별로 나눠, 회차마다 다른 구간을 보여준다.
-    # (안 그러면 preset_classifier의 sample_chars 자체 제한 때문에 매 회차 똑같은
-    # 앞부분만 반복해서 보게 되고, 뒷부분에 있는 서로 다른 정보를 전혀 못 봄)
+    # 분류용 텍스트를 문서 전체에서 구간별로 나눈다 (안 그러면 preset_classifier의
+    # sample_chars 자체 제한 때문에 앞부분만 보게 됨)
     classification_segments = chunk_text(
         text,
         chunk_token_budget=max(classification_sample_chars // 2, 500),
         overlap_ratio=0.0,
         chars_per_token=2.0,
     )
-    print(f"    [F] 분류용으로 문서를 {len(classification_segments)}개 구간으로 나눠 순환 사용")
+    print(f"    [F] 문서를 {len(classification_segments)}개 구간으로 나눠 전체 사전 스캔합니다")
 
+    # ── 1단계: 전체 구간을 한 번씩 분류해 표 구조 후보 메뉴를 만든다 ──
+    menu = scan_all_segments_for_presets(classification_segments, llm_kwargs)
+
+    if not menu:
+        return {
+            "num_tables": 0,
+            "tables": [],
+            "final_coverage": 1.0 if not salient_tokens else 0.0,
+            "stop_reason": "사전 스캔에서 표로 만들 수 있는 구조 후보를 하나도 찾지 못함",
+        }
+
+    print(f"    [F] 사전 스캔 완료 -- 후보 {len(menu)}개: {[m['preset_id'] for m in menu]}")
+
+    # ── 2단계: 메뉴를 순서대로 추출 시도 (coverage/신선도 기준으로 조기 종료 가능) ──
+    # ── 2단계: 메뉴를 순서대로 추출 시도 (coverage/신선도 기준으로 조기 종료 가능) ──
     hard_limit = DEFAULT_HARD_SAFETY_LIMIT if max_tables is None else min(max_tables, DEFAULT_HARD_SAFETY_LIMIT)
+    attempt_limit = min(len(menu), hard_limit)
 
-    for iteration in range(1, hard_limit + 1):
-        segment_idx = (iteration - 1) % len(classification_segments)
-        classification_text = classification_segments[segment_idx]
-        print(f"[F] {iteration}번째 표 시도 중... (분류 구간 {segment_idx + 1}/{len(classification_segments)})")
-        avoid_note = build_avoidance_note(tables)
-        classification = classify_and_select_preset(
-            classification_text, avoid_note=avoid_note,
-            sample_chars=len(classification_text) + 1, **llm_kwargs,
+    for iteration in range(1, attempt_limit + 1):
+        entry = menu[iteration - 1]
+        preset_id = entry["preset_id"]
+        classification = entry["classification"]
+
+        # 🎯 수정 포인트 1: 새로 추가된 target_subject와 segment_indices 추출
+        target_subject = entry.get("target_subject", "")
+        target_indices = sorted(list(entry["segment_indices"]))
+
+        print(f"[F] {iteration}/{attempt_limit}번째 표 추출 중... (preset={preset_id}, "
+              f"주제='{target_subject}', 사전 스캔 구간 {target_indices})")
+
+        # 🎯 수정 포인트 2: 해당 구간(+ 앞뒤 1구간 버퍼)만 발췌하여 타겟 텍스트 조립
+        safe_indices = set()
+        for idx in target_indices:
+            safe_indices.add(max(0, idx - 1))  # 앞 구간 버퍼
+            safe_indices.add(idx)  # 타겟 구간
+            safe_indices.add(min(len(classification_segments) - 1, idx + 1))  # 뒤 구간 버퍼
+
+        target_text = "\n\n".join(classification_segments[i] for i in sorted(safe_indices))
+
+        # 🎯 수정 포인트 3: 맥락 이탈 방지를 위해 context_before에 강력한 지시어 주입
+        # (chunk_orchestrator를 수정하지 않고도 추출 프롬프트 A-2를 제어하는 방법)
+        focus_prompt = (
+            f"[주의사항] 이 표는 오직 '{target_subject}'와(과) 관련된 핵심 정보만 추출해야 합니다. "
+            f"이 주제와 관련이 없거나 맥락이 다른 정보(예: 너무 먼 과거/미래의 사건, 관련 없는 개체)는 "
+            f"표에 절대 포함하지 말고 과감히 버리세요."
+        ) if target_subject and target_subject != "(주제 미특정)" else ""
+
+        # 전체 text 대신 target_text 전달, focus_prompt 전달
+        extraction = process_document(
+            preset_id,
+            target_text,  # <- 변경됨
+            context_before=focus_prompt,  # <- 변경됨
+            context_after="",
+            **llm_kwargs,
+            **chunk_kwargs
         )
-        preset_id = classification.get("preset_id")
 
-        if not preset_id:
-            stop_reason = f"{iteration}번째 시도에서 분류 실패: {classification.get('fallback_reason')}"
-            print(f"    -> 중단: {stop_reason}")
-            break
-
-        extraction = process_document(preset_id, text, context_before="", context_after="", **llm_kwargs, **chunk_kwargs)
         table_markdown = extraction.get("table_markdown", "")
         expected_columns = extraction.get("expected_columns", [])
 
         if not table_markdown.strip():
-            stop_reason = f"{iteration}번째 시도에서 빈 표 추출"
-            print(f"    -> 중단: {stop_reason}")
-            break
+            print(f"    -> 건너뜀: 빈 표 추출")
+            continue
 
         if _is_duplicate_structure(preset_id, expected_columns, table_markdown, tables):
-            stop_reason = f"{iteration}번째 시도가 이전 표와 구조(preset+컬럼)가 동일해 중단"
-            print(f"    -> 중단: {stop_reason}")
-            break
+            print(f"    -> 건너뜀: 이전 표와 내용이 실질적으로 동일")
+            continue
 
         # 이 표를 다시 장문으로 복원해서, 원문 salient token이 얼마나 더 커버됐는지 측정
         verbalization_prompt = build_verbalization_prompt(table_markdown, "", "", genre=genre)
@@ -232,21 +300,24 @@ def extract_multiple_tables(
         if coverage_ratio >= coverage_stop_threshold:
             stop_reason = f"누적 coverage {coverage_ratio:.2f} >= 목표({coverage_stop_threshold})"
             break
-        if not newly_covered and novelty_ratio < _MIN_ROW_KEY_NOVELTY_RATIO and iteration > 1:
+        if not newly_covered and novelty_ratio < _MIN_ROW_KEY_NOVELTY_RATIO and len(tables) > 1:
             stop_reason = (
                 f"추가 표가 새로운 정보를 담지 못함 "
                 f"(salient token 진전 없음, 행 라벨 신선도={novelty_ratio:.2f} < {_MIN_ROW_KEY_NOVELTY_RATIO})"
             )
             break
     else:
-        if max_tables is not None and hard_limit == max_tables:
-            stop_reason = f"표 개수 상한({max_tables}) 도달"
+        if len(menu) <= attempt_limit:
+            stop_reason = f"메뉴 소진 (사전 스캔으로 찾은 후보 {len(menu)}개를 모두 시도함)"
+        elif max_tables is not None and attempt_limit == max_tables:
+            stop_reason = f"표 개수 상한({max_tables}) 도달 (메뉴는 {len(menu)}개 중 {attempt_limit}개만 시도)"
         else:
-            stop_reason = f"안전판({hard_limit}개) 도달 -- max_tables=None이거나 매우 크게 설정해도 항상 걸리는 상한"
+            stop_reason = f"안전판({hard_limit}개) 도달"
 
     final_coverage = len(covered) / len(salient_tokens) if salient_tokens else 1.0
     return {
         "num_tables": len(tables),
+        "menu_size": len(menu),
         "tables": tables,
         "final_coverage": round(final_coverage, 3),
         "stop_reason": stop_reason,
@@ -258,6 +329,8 @@ def extract_multiple_tables(
 # ─────────────────────────────────────────────────────────────
 def build_report_markdown(input_name: str, text: str, result: dict) -> str:
     lines = [f"# {input_name} → 표 {result['num_tables']}개 추출 결과\n"]
+    if "menu_size" in result:
+        lines.append(f"**사전 스캔으로 찾은 구조 후보**: {result['menu_size']}개")
     lines.append(f"**최종 누적 coverage**: {result['final_coverage']}")
     lines.append(f"**정지 사유**: {result['stop_reason']}\n")
 

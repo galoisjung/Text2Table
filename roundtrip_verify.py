@@ -73,68 +73,74 @@ _SALIENT_PATTERNS = [
 # 한국어 NER 모델 (KLUE-NER로 파인튜닝된 KoELECTRA). 숫자/날짜 정규식만으로는
 # 인물/지명/기관 같은 고유명사를 전혀 못 잡는다 -- 서사 텍스트(소설 등)는
 # 애초에 숫자·날짜가 적어서 salient_tokens가 거의 비다시피 하는 문제가 있었다.
-_NER_MODEL_NAME = "Leo97/KoELECTRA-small-v3-modu-ner"
-_NER_RELEVANT_LABELS = {"PS", "PER", "PERSON", "LC", "LOC", "LOCATION", "OG", "ORG", "ORGANIZATION"}
-_ner_pipeline = None  # 지연 로딩 싱글턴. 로딩 실패 시 False로 고정해 재시도하지 않음
-
-
-def _get_ner_pipeline():
-    global _ner_pipeline
-    if _ner_pipeline is not None:
-        return _ner_pipeline
-    try:
-        from transformers import pipeline
-        _ner_pipeline = pipeline("ner", model=_NER_MODEL_NAME, aggregation_strategy="simple")
-    except Exception as e:
-        print(f"    [경고] NER 모델을 불러오지 못해 고유명사 추출을 건너뜁니다 "
-              f"(정규식 기반 숫자/날짜만 사용): {e}")
-        _ner_pipeline = False
-    return _ner_pipeline
-
-
-def extract_named_entities(text: str, max_chars: int = 5000) -> list[str]:
+def extract_named_entities(
+        text: str,
+        max_chars: int = 5000,
+        model: str = DEFAULT_MODEL,
+        ollama_url: str = DEFAULT_OLLAMA_URL,
+        timeout: int = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+) -> list[str]:
     """
-    인물/지명/기관 개체명을 추출한다. 모델을 못 불러오면(미설치/오프라인 등)
-    빈 리스트를 반환하고 정규식 기반 salient_tokens만으로 조용히 폴백한다.
-
-    text가 길면 앞부분 max_chars만 사용한다 -- NER 모델 자체의 입력 길이
-    한도가 훨씬 작기도 하고(보통 512토큰 안팎), salient_tokens는 "이 문서에
-    어떤 고유명사가 등장했는지"를 판단하는 체크리스트 역할이라 문서 전체를
-    다 훑지 않아도 대표적인 인물/지명은 앞부분에서 웬만큼 잡힌다.
+    Ollama LLM을 사용하여 인물/지명/기관 개체명을 추출한다.
+    text가 길면 앞부분 max_chars만 사용한다.
     """
-    ner = _get_ner_pipeline()
-    if not ner:
+    if not text.strip():
         return []
 
+    # LLM이 쉼표로 구분된 단어만 반환하도록 프롬프트를 구성합니다.
+    prompt = f"""다음 텍스트에서 중요한 고유명사(인물, 지명, 기관명, 조직 등)를 추출하세요.
+반드시 추출된 단어들을 쉼표(,)로만 구분하여 반환하고, 부가적인 설명이나 문장은 절대 포함하지 마세요.
+추출할 고유명사가 없다면 '없음'이라고 출력하세요.
+
+텍스트:
+{text[:max_chars]}
+"""
     try:
-        results = ner(text[:max_chars])
+        response = call_ollama_generate(
+            prompt,
+            model=model,
+            ollama_url=ollama_url,
+            timeout=timeout,
+            max_retries=max_retries
+        )
+
+        if "없음" in response:
+            return []
+
+        # 쉼표 기준으로 분리하고 공백 및 불필요한 따옴표 제거
+        entities = [e.strip(" '\"\n") for e in response.split(",")]
+        # 길이가 2 이상인 유효한 단어만 중복 제거하여 반환
+        valid_entities = {e for e in entities if len(e) >= 2}
+        return list(valid_entities)
+
     except Exception as e:
-        print(f"    [경고] NER 추론 실패, 건너뜁니다: {e}")
+        print(f"    [경고] Ollama NER 추출 실패, 건너뜁니다: {e}")
         return []
 
-    entities: list[str] = []
-    seen = set()
-    for r in results:
-        label = str(r.get("entity_group") or r.get("entity") or "").upper()
-        label = re.sub(r"^[BI]-", "", label)  # BIO 태깅 접두사 제거
-        if not any(lbl in label for lbl in _NER_RELEVANT_LABELS):
-            continue
-        word = str(r.get("word", "")).replace("##", "").strip()
-        if len(word) < 2:  # 한 글자짜리는 토큰화 잔재일 확률이 높아 노이즈로 간주
-            continue
-        if word not in seen:
-            seen.add(word)
-            entities.append(word)
-    return entities
 
-
-def extract_salient_tokens(text: str, include_entities: bool = True) -> list[str]:
+def extract_salient_tokens(
+        text: str,
+        include_entities: bool = True,
+        model: str = DEFAULT_MODEL,
+        ollama_url: str = DEFAULT_OLLAMA_URL,
+        timeout: int = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+) -> list[str]:
     tokens: list[str] = []
     for pattern in _SALIENT_PATTERNS:
         tokens.extend(re.findall(pattern, text))
+
     if include_entities:
-        tokens.extend(extract_named_entities(text))
-    # 중복 제거하되 순서는 유지 (등장 빈도보다 "이런 사실이 있었다"가 중요)
+        tokens.extend(extract_named_entities(
+            text,
+            model=model,
+            ollama_url=ollama_url,
+            timeout=timeout,
+            max_retries=max_retries
+        ))
+
+    # 중복 제거하되 순서는 유지
     seen = set()
     unique_tokens = []
     for t in tokens:
@@ -142,6 +148,7 @@ def extract_salient_tokens(text: str, include_entities: bool = True) -> list[str
             seen.add(t)
             unique_tokens.append(t)
     return unique_tokens
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -187,19 +194,19 @@ def extract_hallucination_check_values(table_markdown: str, preset_id: str | Non
 # 2. 검증 오케스트레이션
 # ─────────────────────────────────────────────────────────────
 def verify_extraction(
-    original_long_text: str,
-    candidate_table_markdown: str,
-    context_before: str = "",
-    context_after: str = "",
-    genre: str = "informative",
-    preset_id: str | None = None,
-    model: str = DEFAULT_MODEL,
-    ollama_url: str = DEFAULT_OLLAMA_URL,
-    timeout: int = DEFAULT_TIMEOUT,
-    max_retries: int = DEFAULT_MAX_RETRIES,
-    hallucination_threshold: float = DEFAULT_HALLUCINATION_THRESHOLD,
-    omission_threshold: float = DEFAULT_OMISSION_THRESHOLD,
-    include_entities: bool = True,
+        original_long_text: str,
+        candidate_table_markdown: str,
+        context_before: str = "",
+        context_after: str = "",
+        genre: str = "informative",
+        preset_id: str | None = None,
+        model: str = DEFAULT_MODEL,
+        ollama_url: str = DEFAULT_OLLAMA_URL,
+        timeout: int = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        hallucination_threshold: float = DEFAULT_HALLUCINATION_THRESHOLD,
+        omission_threshold: float = DEFAULT_OMISSION_THRESHOLD,
+        include_entities: bool = True,
 ) -> dict:
     if not candidate_table_markdown.strip():
         return {
@@ -223,12 +230,22 @@ def verify_extraction(
         verbalization_prompt, model=model, ollama_url=ollama_url,
         timeout=timeout, max_retries=max_retries,
     )
-    salient_tokens = extract_salient_tokens(original_long_text, include_entities=include_entities)
+
+    # Ollama 파라미터를 넘겨주도록 수정
+    salient_tokens = extract_salient_tokens(
+        original_long_text,
+        include_entities=include_entities,
+        model=model,
+        ollama_url=ollama_url,
+        timeout=timeout,
+        max_retries=max_retries
+    )
+
     omission_check = check_value_coverage(regenerated_long_text, salient_tokens)
 
     passed = (
-        hallucination_check["coverage_ratio"] >= hallucination_threshold
-        and omission_check["coverage_ratio"] >= omission_threshold
+            hallucination_check["coverage_ratio"] >= hallucination_threshold
+            and omission_check["coverage_ratio"] >= omission_threshold
     )
 
     return {
@@ -241,7 +258,6 @@ def verify_extraction(
             hallucination_check, omission_check, hallucination_threshold, omission_threshold
         ),
     }
-
 
 def _build_fail_reason(hall: dict, omit: dict, hall_th: float, omit_th: float) -> str:
     reasons = []
